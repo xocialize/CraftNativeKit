@@ -70,3 +70,17 @@ import Testing
         #expect(JSONWriter().string(v) == #"{"a":[1,{"b":[]},{}],"c":{"d":"x"},"e":[]}"#)
     }
 }
+
+/// Rust trims whitespace scalar by scalar: a space that a combining mark follows is still trimmed, though Swift sees
+/// the two as one character.
+@Suite struct RustTrimTests {
+    @Test func trimsScalarsNotCharacters() {
+        let s = " \u{0301}x \u{0301}"
+        #expect(rustTrim(s).unicodeScalars.elementsEqual("\u{0301}x \u{0301}".unicodeScalars))
+        #expect(rustTrim("  ").isEmpty && rustTrim("").isEmpty)
+        #expect(rustTrimStart(Substring(" \u{0301}a ")).unicodeScalars.elementsEqual("\u{0301}a ".unicodeScalars))
+        #expect(rustTrimEnd(Substring(" a\u{0301} \u{0301}")).unicodeScalars.elementsEqual(" a\u{0301} \u{0301}".unicodeScalars))
+        #expect(rustTrimEnd(Substring(" a \u{2003}")).unicodeScalars.elementsEqual(" a".unicodeScalars))
+        #expect(rustTrim("\u{3000}全角\u{3000}") == "全角")
+    }
+}

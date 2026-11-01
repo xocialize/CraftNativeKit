@@ -524,3 +524,12 @@ extension Unicode.Scalar: JSONCodable {
         self = c
     }
 }
+
+/// A Rust `Vec<[T; N]>`: a sequence of sequences, each exactly `count` long.
+public func decodeFixedArrays<T: JSONDecodable>(_ json: JSON, count: Int) throws(JSONDecodeError) -> [[T]] {
+    guard case .array(let items) = json else { throw .invalidType(json, expected: "a sequence") }
+    var out: [[T]] = []
+    out.reserveCapacity(items.count)
+    for item in items { out.append(try decodeFixedArray(item, count: count)) }
+    return out
+}

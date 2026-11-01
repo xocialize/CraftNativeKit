@@ -2,11 +2,13 @@
 // mapping, and `format!("{v:.N}")`.
 import Foundation
 
-/// Rust's `str::trim`: strips Unicode `White_Space` from both ends.
+/// Rust's `str::trim`: strips Unicode `White_Space` scalars from both ends. Scalar by scalar, not character by
+/// character: a space that a combining mark follows is still whitespace to Rust.
 public func rustTrim(_ s: String) -> Substring {
-    let ws: (Character) -> Bool = { $0.unicodeScalars.allSatisfy(\.properties.isWhitespace) }
-    guard let start = s.firstIndex(where: { !ws($0) }), let end = s.lastIndex(where: { !ws($0) }) else { return "" }
-    return s[start ... end]
+    let u = s.unicodeScalars
+    guard let start = u.firstIndex(where: { !$0.properties.isWhitespace }),
+          let end = u.lastIndex(where: { !$0.properties.isWhitespace }) else { return "" }
+    return Substring(u[start ... end])
 }
 
 /// Rust's `to_ascii_lowercase`: only A–Z change.
@@ -65,18 +67,18 @@ public func rustLines(_ s: String) -> [String] {
     return lines
 }
 
-/// Rust's `str::trim_start`.
+/// Rust's `str::trim_start`, scalar by scalar.
 public func rustTrimStart(_ s: Substring) -> Substring {
-    let ws: (Character) -> Bool = { $0.unicodeScalars.allSatisfy(\.properties.isWhitespace) }
-    guard let start = s.firstIndex(where: { !ws($0) }) else { return s[s.endIndex...] }
-    return s[start...]
+    let u = s.unicodeScalars
+    guard let start = u.firstIndex(where: { !$0.properties.isWhitespace }) else { return "" }
+    return Substring(u[start...])
 }
 
-/// Rust's `str::trim_end`.
+/// Rust's `str::trim_end`, scalar by scalar.
 public func rustTrimEnd(_ s: Substring) -> Substring {
-    let ws: (Character) -> Bool = { $0.unicodeScalars.allSatisfy(\.properties.isWhitespace) }
-    guard let end = s.lastIndex(where: { !ws($0) }) else { return s[s.startIndex ..< s.startIndex] }
-    return s[...end]
+    let u = s.unicodeScalars
+    guard let end = u.lastIndex(where: { !$0.properties.isWhitespace }) else { return "" }
+    return Substring(u[...end])
 }
 
 /// Rust's `str::parse::<f64>()`: an optional sign, then `inf`, `infinity` or `nan` (any case), or

@@ -10,7 +10,7 @@ Every `#[derive(... Serialize ...)]` struct and enum in the given files becomes 
   `default = "fn"`), `skip_serializing_if`, `skip`, `deserialize_with`;
 - enums: bare-string unit enums, externally, internally (`tag`) and adjacently (`tag` + `content`)
   tagged enums, with struct-variant fields keeping their Rust names (serde's `rename_all` on an
-  enum renames variants only);
+  enum renames variants only; one on a variant renames its fields);
 - `id_type!` newtypes (`#[serde(transparent)]`);
 - tuple structs (a newtype is its inner value, more fields a sequence), with fields `_0`, `_1`…;
 - generic structs (`PropChange<T>`), `BTreeMap<K, V>` (CNCore writes the keys in Rust's order), field and
@@ -479,6 +479,16 @@ def decode_field(f, rename, struct_default, var="f"):
             fallback = f"d.{f.plain}" if struct_default and s.get("default") is not True else default_expr(f.ty)
             return f"try {var}.get(\"{key}\", default: {fallback}, with: {fn})"
         return f"try {var}.required(\"{key}\", with: {fn})"
+    if f.ty[0] == "vec" and f.ty[1][0] == "fixed":
+        # `Vec<[T; N]>`: every element exactly N long.
+        rows = f"{{ (j: JSON) throws(JSONDecodeError) -> {swift_type(f.ty)} in try decodeFixedArrays(j, count: {f.ty[1][2]}) }}"
+        if s.get("default") is True or struct_default or isinstance(s.get("default"), str):
+            if isinstance(s.get("default"), str):
+                fallback = default_fn(s["default"])
+            else:
+                fallback = f"d.{f.plain}" if struct_default and s.get("default") is not True else "[]"
+            return f"try {var}.get(\"{key}\", default: {fallback}, with: {rows})"
+        return f"try {var}.required(\"{key}\", with: {rows})"
     fixed = f.ty[0] == "fixed"
     if f.ty[0] == "opt" and f.ty[1][0] == "fixed":
         # `Option<[T; N]>`: null or absent is nil, else exactly N elements.
@@ -726,8 +736,9 @@ def emit_enum(it, out):
             else:
                 out.append("            var c = JSONObject()")
                 target = "c"
+            vrename = v.serde.get("rename_all") == "camelCase"
             for f in v.fields:
-                line = encode_field(f, False, f.swift, target)
+                line = encode_field(f, vrename, f.swift, target)
                 if line:
                     out.append(f"            {line}")
             if tag and content:
@@ -769,7 +780,8 @@ def emit_enum(it, out):
                 out.append(f"            self = .{case}({args})")
         else:
             out.append(f"            let vf = try JSONFields(payload, \"{it.name}::{v.name}\")")
-            args = ", ".join(f"{f.label}: {decode_field(f, False, False, 'vf')}" for f in v.fields)
+            vrename = v.serde.get("rename_all") == "camelCase"
+            args = ", ".join(f"{f.label}: {decode_field(f, vrename, False, 'vf')}" for f in v.fields)
             out.append(f"            self = .{case}({args})")
     out.append("        default:")
     out.append(f"            throw .unknownVariant(name, expected: Self.variantNames)")
