@@ -99,18 +99,22 @@ private func extPenRect(_ style: UInt32, _ width: UInt32, _ brush: UInt32) throw
     #expect(img.px == [8, 9, 10, 11, 4, 5, 6, 7, 0, 1, 2, 3])
 }
 
-@Test func placeFitsTheFrameScalesStrokesAndDropsFarPaths() throws {
+/// deckcraft and WordCraft run this test with the same assertions; it runs under both crop rules.
+@Test(arguments: [MetafileCropRule.deckcraft, .wordCraft])
+func placeFitsTheFrameScalesStrokesAndDropsFarPaths(rule: MetafileCropRule) throws {
     let pic = MetafilePicture(width: 100, height: 50, items: [
         .path(segs: [.move(0, 0), .line(10, 10)], fill: nil, stroke: S(C(0, 0, 0, 255), 4), evenOdd: true, region: nil),
         .path(segs: [.move(0, 0), .line(2e6, 0)], fill: nil, stroke: nil, evenOdd: true, region: nil),
     ])
-    let placed = pic.place(MetafileRect(0, 0, 200, 100), crop: .zero)
+    let placed = pic.place(MetafileRect(0, 0, 200, 100), crop: .zero, rule: rule)
     #expect(placed.count == 1)
     guard case .path(_, _, let stroke, _, _)? = placed.first else { Issue.record("expected a path"); return }
     #expect(stroke?.width == 8)
 }
 
-@Test func placeKeepsOnlyFiniteBoundedBitmapsWithArea() throws {
+/// deckcraft and WordCraft run this test with the same assertions; it runs under both crop rules.
+@Test(arguments: [MetafileCropRule.deckcraft, .wordCraft])
+func placeKeepsOnlyFiniteBoundedBitmapsWithArea(rule: MetafileCropRule) throws {
     func bmp(_ r: SIMD4<Float>) -> MetafileItem { .bitmap(rect: r, width: 1, height: 1, rgba: [0, 0, 0, 0], region: nil) }
     let pic = MetafilePicture(width: 100, height: 50, items: [
         bmp(SIMD4(.nan, 0, 10, 10)),
@@ -119,7 +123,7 @@ private func extPenRect(_ style: UInt32, _ width: UInt32, _ brush: UInt32) throw
         bmp(SIMD4(0, 0, .infinity, 10)),
         bmp(SIMD4(10, 5, 10, 10)),
     ])
-    let placed = pic.place(MetafileRect(0, 0, 200, 100), crop: .zero)
+    let placed = pic.place(MetafileRect(0, 0, 200, 100), crop: .zero, rule: rule)
     #expect(placed.count == 1)
     guard case .bitmap(let index, let rect, _)? = placed.first else { Issue.record("expected a bitmap"); return }
     #expect(index == 4 && rect == MetafileRect(20, 10, 40, 30))

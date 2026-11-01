@@ -1,7 +1,9 @@
-// CNMetafile — placing a picture on a target (a page or a device): the fitted transform, paths in target units
-// and bitmaps as target rectangles. The rasteriser and the PDF writer only paint the result. Port of deckcraft
-// crates/metafile/src/place.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors), with the
-// pieces of kurbo it uses (Affine, BezPath, Rect; MIT OR Apache-2.0, © the kurbo authors) as small local types.
+// CNMetafile — placing a picture on a target (a page or a device): the fitted transform, paths in target units and
+// bitmaps as target rectangles. The rasteriser and the PDF writer only paint the result. Port of deckcraft
+// crates/metafile/src/place.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors), with the pieces
+// of kurbo it uses (Affine, BezPath, Rect; MIT OR Apache-2.0, © the kurbo authors) as small local types.
+// `Metafile.cropWindow` and the `.wordCraft` crop rule are from WordCraft crates/metafile/src/place.rs at fd7f6621
+// (MIT OR Apache-2.0, © ArtCraft Team and the WordCraft contributors) (0cca2f7d, fc5063c3).
 import CoreGraphics
 import CNCore
 
@@ -192,6 +194,37 @@ public enum MetafilePlacedItem: Equatable, Sendable {
     }
 }
 
+/// How `fit` and `place` read crop fractions (left, top, right, bottom) that leave little of an axis.
+public enum MetafileCropRule: Sendable {
+    /// deckcraft's: each side is clamped to 0–0.95 and at least 5% of an axis shows, so a sliver crop is widened
+    /// to 5% (the picture comes out smaller than the file says).
+    case deckcraft
+    /// WordCraft's (`crop_window`): each side is clamped to 0–1 and at least 0.5% of an axis shows, so a sliver
+    /// crop (a header bar that is 2.7% of a page-sized metafile) is drawn at the size the file gives.
+    case wordCraft
+}
+
+extension Metafile {
+    /// The least of a source axis WordCraft's crop keeps (0.5%). Layout makes a picture's frame at most 4000 pt a
+    /// side, so the whole source then spans at most 800,000 pt and stays inside the ±1e6 that `place` keeps.
+    public static let minVisibleCrop = 0.005
+
+    /// The part of a picture's source that `crop` (left, top, right, bottom fractions of the source) keeps, as
+    /// fractions of the source: `[left, top, width, height]`, bitmap or metafile alike (WordCraft's `crop_window`).
+    /// Each side is taken as 0–1 (junk as 0). When the two sides of an axis leave less than 0.5% of it, the left
+    /// (top) side stands and 0.5% shows.
+    public static func cropWindow(_ crop: SIMD4<Float>) -> SIMD4<Double> {
+        func side(_ v: Float) -> Double { v.isFinite ? Double(v.clamped(0, 1)) : 0 }
+        func axis(_ lo: Double, _ hi: Double) -> (Double, Double) {
+            let lo = Swift.min(lo, 1 - minVisibleCrop)
+            return (lo, Swift.max(1 - lo - hi, minVisibleCrop))
+        }
+        let (x, w) = axis(side(crop[0]), side(crop[2]))
+        let (y, h) = axis(side(crop[1]), side(crop[3]))
+        return SIMD4(x, y, w, h)
+    }
+}
+
 extension MetafilePicture {
     /// Whether the picture has a finite, positive size, so it can be fitted into a frame.
     public var hasSize: Bool {
@@ -199,22 +232,33 @@ extension MetafilePicture {
     }
 
     /// The transform that fits the picture into `r` with the crop fractions `crop` (left, top, right, bottom)
-    /// removed first: the visible part fills `r`. nil for a degenerate size.
-    public func fit(_ r: MetafileRect, crop: SIMD4<Float>) -> MetafileAffine? {
-        func frac(_ v: Float) -> Double { v.isFinite ? Double(v.clamped(0, 0.95)) : 0 }
-        let (cl, ct, cr, cb) = (frac(crop[0]), frac(crop[1]), frac(crop[2]), frac(crop[3]))
+    /// removed first: the visible part fills `r`. nil for a degenerate size. `rule` says how a crop that leaves
+    /// little or nothing of an axis is read (`MetafileCropRule`).
+    public func fit(_ r: MetafileRect, crop: SIMD4<Float>, rule: MetafileCropRule = .deckcraft) -> MetafileAffine? {
         let (w, h) = (Double(width), Double(height))
-        let sx = r.width / (w * (1 - cl - cr).rustMax(0.05))
-        let sy = r.height / (h * (1 - ct - cb).rustMax(0.05))
+        let (cl, ct, sx, sy): (Double, Double, Double, Double)
+        switch rule {
+        case .deckcraft:
+            func frac(_ v: Float) -> Double { v.isFinite ? Double(v.clamped(0, 0.95)) : 0 }
+            let (cr, cb) = (frac(crop[2]), frac(crop[3]))
+            (cl, ct) = (frac(crop[0]), frac(crop[1]))
+            sx = r.width / (w * (1 - cl - cr).rustMax(0.05))
+            sy = r.height / (h * (1 - ct - cb).rustMax(0.05))
+        case .wordCraft:
+            let c = Metafile.cropWindow(crop)
+            (cl, ct) = (c[0], c[1])
+            sx = r.width / (w * c[2])
+            sy = r.height / (h * c[3])
+        }
         guard sx.isFinite, sy.isFinite, sx > 0, sy > 0 else { return nil }
         return .translate(r.x0 - cl * w * sx, r.y0 - ct * h * sy) * .scale(sx, sy)
     }
 
-    /// The items placed into `r` with `crop` applied. Items that are not finite or reach past ±1e6 target units are
-    /// left out (they are far off any page), as are bitmaps with no area. Stroke widths are scaled to target units
-    /// (along the mean axis scale, so a non-uniform fit keeps strokes even).
-    public func place(_ r: MetafileRect, crop: SIMD4<Float>) -> [MetafilePlacedItem] {
-        guard let tf = fit(r, crop: crop) else { return [] }
+    /// The items placed into `r` with `crop` applied (read by `rule`, as for `fit`). Items that are not finite or
+    /// reach past ±1e6 target units are left out (they are far off any page), as are bitmaps with no area. Stroke
+    /// widths are scaled to target units (along the mean axis scale, so a non-uniform fit keeps strokes even).
+    public func place(_ r: MetafileRect, crop: SIMD4<Float>, rule: MetafileCropRule = .deckcraft) -> [MetafilePlacedItem] {
+        guard let tf = fit(r, crop: crop, rule: rule) else { return [] }
         let c = tf.coeffs
         let k = (Swift.abs(c[0]) + Swift.abs(c[3])) / 2
         var out: [MetafilePlacedItem] = []

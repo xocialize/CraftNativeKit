@@ -1,6 +1,8 @@
-// CNMetafile — EMF reader (MS-EMF). Records are (type, size in bytes) followed by a payload; offsets inside a
-// record (bitmap info and bits) are relative to the record start, so each handler reads the record slice. Port
-// of deckcraft crates/metafile/src/emf.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors).
+// CNMetafile — EMF reader (MS-EMF). Records are (type, size in bytes) followed by a payload; offsets inside a record
+// (bitmap info and bits) are relative to the record start, so each handler reads the record slice. Port of deckcraft
+// crates/metafile/src/emf.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors). Blits decode only
+// the cropped part of a DIB, as WordCraft crates/metafile/src/emf.rs at fd7f6621 (MIT OR Apache-2.0, © ArtCraft Team
+// and the WordCraft contributors) does (45d2546b).
 import CNCore
 
 enum EMF {
@@ -407,11 +409,10 @@ enum EMF {
     private static func blit(_ cv: inout Canvas, _ r: Bytes, _ dst: R4, _ src: R4, _ at: (Int, Int), _ blend: Blend) {
         guard let bo = r.u32(at.0), let bl = r.u32(at.0 + 4), let po = r.u32(at.1), let pl = r.u32(at.1 + 4), pl != 0,
               let info = r.slice(Int(bo), Int(bl)), let pixels = r.slice(Int(po), Int(pl)),
-              var img = DIB.decode(info, pixels, keepAlpha: blend.perPixel)
+              case let s = [Int64(rustCast: src[0]), Int64(rustCast: src[1]), Int64(rustCast: src[2]), Int64(rustCast: src[3])],
+              case (var img, let d)? = DIB.decodeClip(info, pixels, keepAlpha: blend.perPixel, s, dst)
         else { return }
         DIB.prepare(&img, blend)
-        let s = [Int64(rustCast: src[0]), Int64(rustCast: src[1]), Int64(rustCast: src[2]), Int64(rustCast: src[3])]
-        guard let (cropped, d) = DIB.clipBlit(img, s, dst) else { return }
-        cv.bitmap(d, cropped)
+        cv.bitmap(d, img)
     }
 }

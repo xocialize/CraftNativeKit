@@ -1,7 +1,8 @@
-// CNMetafile — device-independent bitmaps. BITMAPINFOHEADER DIBs at 1/4/8/16/24/32 bpp with BI_RGB or
-// BI_BITFIELDS decode to RGBA8 rows, top-down. Compressed (RLE, JPEG, PNG) and V4/V5-only features are not
-// decoded. Port of deckcraft crates/metafile/src/dib.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft
-// contributors).
+// CNMetafile — device-independent bitmaps. BITMAPINFOHEADER DIBs at 1/4/8/16/24/32 bpp with BI_RGB or BI_BITFIELDS
+// decode to RGBA8 rows, top-down. Compressed (RLE, JPEG, PNG) and V4/V5-only features are not decoded. Port of
+// deckcraft crates/metafile/src/dib.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors).
+// `decodeClip` and `clipRect` are from WordCraft crates/metafile/src/dib.rs at fd7f6621 (MIT OR Apache-2.0, ©
+// ArtCraft Team and the WordCraft contributors) (45d2546b).
 
 private let biRGB: UInt32 = 0
 private let biBitfields: UInt32 = 3
@@ -87,30 +88,85 @@ enum DIB {
     /// Decodes a DIB given as its info part (header plus masks and palette) and its pixel bits. The 32-bit alpha
     /// byte is kept only when `keepAlpha` is set (per-pixel alpha blends); otherwise pixels are opaque.
     static func decode(_ info: Bytes, _ bits: Bytes, keepAlpha: Bool) -> Rgba? {
-        guard let hd = Header.read(info) else { return nil }
-        let (pixels, o1) = hd.w.multipliedReportingOverflow(by: hd.h)
-        guard !o1, pixels > 0, pixels <= Metafile.maxPixels else { return nil }
-        let (wb, o2) = hd.w.multipliedReportingOverflow(by: hd.bpp)
-        let (wb31, o3) = wb.addingReportingOverflow(31)
-        guard !o2, !o3 else { return nil }
-        let stride = wb31 / 32 * 4
-        let (dataLen, o4) = stride.multipliedReportingOverflow(by: hd.h)
-        guard !o4, let data = bits.slice(0, dataLen), let pal = info.slice(hd.palOff, hd.palN * 4) else { return nil }
-        let d = data.array
-        let palette = pal.array
-        var px = [UInt8](repeating: 0, count: pixels * 4)
+        guard let v = Validated(info, bits) else { return nil }
+        let whole = Span(x0: 0, x1: v.hd.w, r0: 0, r1: v.hd.h)
+        var decoded = 0
+        guard let px = decodeSpan(v, whole, keepAlpha, &decoded) else { return nil }
+        return Rgba(w: v.hd.w, h: v.hd.h, bottomUp: !v.hd.topDown, px: px)
+    }
+
+    /// Decodes the part of a DIB that the source rectangle `src` = `[x, y, w, h]` selects and returns it (top-down)
+    /// with the part of the destination `dst` that it fills; see `clipRect` for the coordinates. `info` is the info
+    /// part (header plus masks and palette) and `bits` the pixel bits; `keepAlpha` as for `decode`. Only the clipped
+    /// rows and columns are decoded, so the work and the memory follow the crop, not the whole bitmap; the whole
+    /// bitmap is still validated (size cap, palette, bits length). Gives what `decode` then `clipBlit` gives.
+    static func decodeClip(_ info: Bytes, _ bits: Bytes, keepAlpha: Bool, _ src: [Int64], _ dst: R4) -> (Rgba, R4)? {
+        var decoded = 0
+        return decodeClip(info, bits, keepAlpha: keepAlpha, src, dst, decoded: &decoded)
+    }
+
+    /// `decodeClip`, adding the number of pixels decoded to `decoded` (the tests check that it follows the crop).
+    static func decodeClip(_ info: Bytes, _ bits: Bytes, keepAlpha: Bool, _ src: [Int64], _ dst: R4, decoded: inout Int) -> (Rgba, R4)? {
+        guard let v = Validated(info, bits),
+              let (span, out) = clipRect(w: v.hd.w, h: v.hd.h, bottomUp: !v.hd.topDown, src, dst),
+              let px = decodeSpan(v, span, keepAlpha, &decoded)
+        else { return nil }
+        return (Rgba(w: span.x1 - span.x0, h: span.r1 - span.r0, bottomUp: false, px: px), out)
+    }
+
+    /// A DIB whose header, size, palette and bits length passed the checks every decode makes first.
+    private struct Validated {
+        let hd: Header
+        let stride: Int
+        /// The pixel bits, `stride × h` bytes, as a view of the shared buffer.
+        let data: Bytes
+        let palette: [UInt8]
+
+        init?(_ info: Bytes, _ bits: Bytes) {
+            guard let hd = Header.read(info) else { return nil }
+            let (pixels, o1) = hd.w.multipliedReportingOverflow(by: hd.h)
+            guard !o1, pixels > 0, pixels <= Metafile.maxPixels else { return nil }
+            let (wb, o2) = hd.w.multipliedReportingOverflow(by: hd.bpp)
+            let (wb31, o3) = wb.addingReportingOverflow(31)
+            guard !o2, !o3 else { return nil }
+            let stride = wb31 / 32 * 4
+            let (dataLen, o4) = stride.multipliedReportingOverflow(by: hd.h)
+            guard !o4, let data = bits.slice(0, dataLen), let pal = info.slice(hd.palOff, hd.palN * 4) else { return nil }
+            (self.hd, self.stride, self.data, palette) = (hd, stride, data, pal.array)
+        }
+    }
+
+    /// The columns `x0..<x1` and top-down rows `r0..<r1` of a bitmap that a clipped source rectangle covers.
+    struct Span {
+        var x0: Int
+        var x1: Int
+        var r0: Int
+        var r1: Int
+    }
+
+    /// Decodes the pixels of `span` (top-down rows), counting them into `decoded`.
+    private static func decodeSpan(_ v: Validated, _ span: Span, _ keepAlpha: Bool, _ decoded: inout Int) -> [UInt8]? {
+        let hd = v.hd
+        let (ow, oh) = (span.x1 - span.x0, span.r1 - span.r0)
+        let (n, o1) = ow.multipliedReportingOverflow(by: oh)
+        let (len, o2) = n.multipliedReportingOverflow(by: 4)
+        guard ow > 0, oh > 0, !o1, !o2 else { return nil }
+        // Rows index the shared buffer directly: every read stays inside its row, and the rows were checked to lie
+        // inside the bits.
+        let (d, base) = (v.data.buffer, v.data.start)
+        var px = [UInt8](repeating: 0, count: len)
+        var o = 0
         if hd.bpp <= 8 {
             // Indexed: every possible index looked up once (missing entries are black).
             var lut = [UInt8](repeating: 0, count: 256 * 4)
             for i in 0 ..< 256 {
-                let c = Self.palette(palette, i)
+                let c = Self.palette(v.palette, i)
                 (lut[i * 4], lut[i * 4 + 1], lut[i * 4 + 2], lut[i * 4 + 3]) = (c.0, c.1, c.2, 255)
             }
             let (bpp, mask) = (hd.bpp, UInt8(truncatingIfNeeded: (1 << hd.bpp) - 1))
-            for y in 0 ..< hd.h {
-                let row = (hd.topDown ? y : hd.h - 1 - y) * stride
-                var o = y * hd.w * 4
-                for x in 0 ..< hd.w {
+            for y in span.r0 ..< span.r1 {
+                let row = base + (hd.topDown ? y : hd.h - 1 - y) * v.stride
+                for x in span.x0 ..< span.x1 {
                     let bit = x * bpp
                     guard let b = byteAt(d, row + bit / 8) else { return nil }
                     let k = Int((b >> UInt8(8 - bpp - bit % 8)) & mask) * 4
@@ -118,21 +174,19 @@ enum DIB {
                     o += 4
                 }
             }
-            return Rgba(w: hd.w, h: hd.h, bottomUp: !hd.topDown, px: px)
+            decoded += n
+            return px
         }
-        for y in 0 ..< hd.h {
-            let srcRow = hd.topDown ? y : hd.h - 1 - y
-            let row = srcRow * stride
-            for x in 0 ..< hd.w {
-                guard let p = pixel(d, row, x, hd, palette, keepAlpha) else { return nil }
-                let o = (y * hd.w + x) * 4
-                px[o] = p.0
-                px[o + 1] = p.1
-                px[o + 2] = p.2
-                px[o + 3] = p.3
+        for y in span.r0 ..< span.r1 {
+            let row = base + (hd.topDown ? y : hd.h - 1 - y) * v.stride
+            for x in span.x0 ..< span.x1 {
+                guard let p = pixel(d, row, x, hd, v.palette, keepAlpha) else { return nil }
+                (px[o], px[o + 1], px[o + 2], px[o + 3]) = p
+                o += 4
             }
         }
-        return Rgba(w: hd.w, h: hd.h, bottomUp: !hd.topDown, px: px)
+        decoded += n
+        return px
     }
 
     private static func pixel(_ data: [UInt8], _ row: Int, _ x: Int, _ hd: Header, _ pal: [UInt8], _ keepAlpha: Bool) -> (UInt8, UInt8, UInt8, UInt8)? {
@@ -181,28 +235,35 @@ enum DIB {
         return UInt8(truncatingIfNeeded: (val * 255 + max / 2) / max)
     }
 
-    /// Clips a source rectangle `src` = `[x, y, w, h]` to the bitmap and returns the cropped pixels (top-down)
-    /// with the part of the destination `dst` that they fill. `src` is in DIB pixel coordinates (`y` counted from
-    /// the DIB's origin, so bottom-up images count from the bottom); a non-positive source size means the whole
-    /// bitmap. Clipping shrinks the destination by the same ratio and shifts it by the clipped-off part, so the
-    /// rest of the image keeps its place. A negative destination extent is kept (the caller mirrors).
-    static func clipBlit(_ img: Rgba, _ src: [Int64], _ dst: R4) -> (Rgba, R4)? {
-        let (iw, ih) = (Int64(img.w), Int64(img.h))
+    /// Clips a source rectangle `src` = `[x, y, w, h]` to a `w` × `h` bitmap and returns the columns and top-down
+    /// rows it covers with the part of the destination `dst` that they fill. `src` is in DIB pixel coordinates (`y`
+    /// counted from the DIB's origin, so bottom-up images count from the bottom); a non-positive source size means
+    /// the whole bitmap. Clipping shrinks the destination by the same ratio and shifts it by the clipped-off part,
+    /// so the rest of the image keeps its place. A negative destination extent is kept (the caller mirrors). nil
+    /// when nothing of the bitmap is covered.
+    static func clipRect(w: Int, h: Int, bottomUp: Bool, _ src: [Int64], _ dst: R4) -> (Span, R4)? {
+        let (iw, ih) = (Int64(w), Int64(h))
         let s = src.count == 4 && src[2] > 0 && src[3] > 0 ? src : [0, 0, iw, ih]
         let (sx, sy, sw, sh) = (s[0], s[1], s[2], s[3])
         // The request's top row in top-down order.
-        let top = img.bottomUp ? ih.subtractingSaturating(sy).subtractingSaturating(sh) : sy
+        let top = bottomUp ? ih.subtractingSaturating(sy).subtractingSaturating(sh) : sy
         let (x0, x1) = (Swift.max(sx, 0), Swift.min(sx.addingSaturating(sw), iw))
         let (r0, r1) = (Swift.max(top, 0), Swift.min(top.addingSaturating(sh), ih))
         guard x1 > x0, r1 > r0 else { return nil }
         let (kx, ky) = (dst[2] / Double(sw), dst[3] / Double(sh))
         let out = R4(dst[0] + Double(x0 - sx) * kx, dst[1] + Double(r0 - top) * ky, Double(x1 - x0) * kx, Double(r1 - r0) * ky)
-        let (cx0, cx1, cr0, cr1) = (Int(x0), Int(x1), Int(r0), Int(r1))
-        let (ow, oh) = (cx1 - cx0, cr1 - cr0)
+        return (Span(x0: Int(x0), x1: Int(x1), r0: Int(r0), r1: Int(r1)), out)
+    }
+
+    /// Clips a source rectangle to a decoded bitmap (see `clipRect`) and returns the cropped pixels (top-down) with
+    /// the part of the destination that they fill.
+    static func clipBlit(_ img: Rgba, _ src: [Int64], _ dst: R4) -> (Rgba, R4)? {
+        guard let (c, out) = clipRect(w: img.w, h: img.h, bottomUp: img.bottomUp, src, dst) else { return nil }
+        let (ow, oh) = (c.x1 - c.x0, c.r1 - c.r0)
         var px: [UInt8] = []
         px.reserveCapacity(ow * oh * 4)
-        for row in cr0 ..< cr1 {
-            let st = (row * img.w + cx0) * 4
+        for row in c.r0 ..< c.r1 {
+            let st = (row * img.w + c.x0) * 4
             guard st + ow * 4 <= img.px.count else { return nil }
             px.append(contentsOf: img.px[st ..< st + ow * 4])
         }

@@ -1,7 +1,9 @@
-// CNMetafile — path operations in `Double` and the shape builders that turn WMF/EMF rectangles, ellipses and
-// arcs into cubic Béziers (the classic 4/3·tan(Δ/4) approximation, at most 90° per piece). Port of deckcraft
-// crates/metafile/src/geom.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors), plus the
-// Rust float semantics the port needs to give deckcraft's numbers bit for bit.
+// CNMetafile — path operations in `Double` and the shape builders that turn WMF/EMF rectangles, ellipses and arcs
+// into cubic Béziers (the classic 4/3·tan(Δ/4) approximation, at most 90° per piece). Port of deckcraft
+// crates/metafile/src/geom.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors), plus the Rust
+// float semantics the port needs to give deckcraft's numbers bit for bit. `subpaths` sizes its ops exactly, as
+// WordCraft crates/metafile/src/geom.rs at fd7f6621 (MIT OR Apache-2.0, © ArtCraft Team and the WordCraft
+// contributors) does (c98efffc).
 import CNCore
 import Darwin
 
@@ -156,9 +158,18 @@ private func arc(_ cx: Double, _ cy: Double, _ rx: Double, _ ry: Double, _ a0: D
 /// Consecutive subpaths: `counts[i]` points each, taken in order from `pts`. Counts that run past the point list
 /// are cut short rather than failing the whole record.
 func subpaths(_ pts: [P], _ counts: [Int], close: Bool) -> [Op] {
+    // The exact size first: empty groups add no ops, so a long count list of zeros (file data) mustn't reserve room
+    // the canvas budget never sees.
+    var (n, at) = (0, 0)
+    for c in counts {
+        let (sum, overflow) = at.addingReportingOverflow(c)
+        let end = Swift.min(overflow ? Int.max : sum, pts.count)
+        if end > at { n = n.addingSaturating(end - at + (close ? 1 : 0)) }
+        at = end
+    }
     var ops: [Op] = []
-    ops.reserveCapacity(pts.count + counts.count)
-    var at = 0
+    ops.reserveCapacity(n)
+    at = 0
     for c in counts {
         let (sum, overflow) = at.addingReportingOverflow(c)
         let end = Swift.min(overflow ? Int.max : sum, pts.count)

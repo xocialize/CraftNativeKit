@@ -1,7 +1,9 @@
-// CNMetafile — drawing state shared by the WMF and EMF readers: window/viewport mapping and the EMF world
-// transform, pen and brush selection through an object table, the DC save stack and path brackets. Output is
-// device-space items; `Metafile.build` maps them into the picture frame. Port of deckcraft
-// crates/metafile/src/canvas.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors).
+// CNMetafile — drawing state shared by the WMF and EMF readers: window/viewport mapping and the EMF world transform,
+// pen and brush selection through an object table, the DC save stack and path brackets. Output is device-space
+// items; `Metafile.build` maps them into the picture frame. Port of deckcraft crates/metafile/src/canvas.rs (MIT OR
+// Apache-2.0, © ArtCraft Team and the DeckCraft contributors). The object table's free-slot set and the in-place
+// mapping of shape ops are from WordCraft crates/metafile/src/canvas.rs at fd7f6621 (MIT OR Apache-2.0, © ArtCraft
+// Team and the WordCraft contributors) (45d2546b).
 import CNCore
 import Darwin
 
@@ -280,7 +282,12 @@ struct Canvas {
     private var saved: [Saved] = []
     /// Bytes held by the items so far (path ops and pixels), capped at `Metafile.maxBytes`.
     private var used = 0
-    private var objects: [Obj?] = []
+    private(set) var objects: [Obj?] = []
+    /// Indices below `objects.count` that hold no object, so the WMF handle table finds its lowest free slot
+    /// without scanning.
+    private var free = SlotSet()
+    /// Free slots handed out by `addObject(nil, …)`; the tests check it grows by one per create that reuses a slot.
+    private(set) var slotProbes = 0
     private var pen = Pen(style: 0, width: 0, color: MetafileColor(0, 0, 0, 255))
     private var brush = Brush(bsSolid, MetafileColor(255, 255, 255, 255))
     private var evenOdd = true
@@ -532,7 +539,7 @@ struct Canvas {
     /// The default clip: later records are not limited by a region.
     mutating func resetClip() { clip = nil }
 
-    /// Stores an object in `slot` (EMF index), or in the first free slot (WMF handle table).
+    /// Stores an object in `slot` (EMF index), or in the lowest free slot (WMF handle table).
     mutating func addObject(_ slot: Int?, _ obj: Obj) {
         // A pattern brush's pixels count against the byte budget like drawn items.
         if case .brush(let b) = obj, let p = b.pattern {
@@ -544,10 +551,16 @@ struct Canvas {
             used = next
         }
         if let i = slot {
-            guard i < Metafile.maxObjects else { return }
-            if objects.count <= i { objects += [Obj?](repeating: nil, count: i + 1 - objects.count) }
+            guard i >= 0, i < Metafile.maxObjects else { return }
+            if objects.count <= i {
+                // Growing the table leaves the slots between the old end and `i` free.
+                for k in objects.count ..< i { free.insert(k) }
+                objects += [Obj?](repeating: nil, count: i + 1 - objects.count)
+            }
+            free.remove(i)
             objects[i] = obj
-        } else if let i = objects.firstIndex(where: { $0 == nil }) {
+        } else if let i = free.popFirst(), objects.indices.contains(i) {
+            slotProbes += 1
             objects[i] = obj
         } else if objects.count < Metafile.maxObjects {
             objects.append(obj)
@@ -556,7 +569,10 @@ struct Canvas {
 
     mutating func deleteObject(_ i: UInt32) {
         let k = Int(i)
-        if objects.indices.contains(k) { objects[k] = nil }
+        if objects.indices.contains(k) {
+            objects[k] = nil
+            free.insert(k)
+        }
     }
 
     /// Selects an object by index; indices with the high bit set are stock objects.
@@ -687,8 +703,10 @@ struct Canvas {
 
     /// Draws logical-space ops with the current pen (`stroke`) and brush (`fill`), or appends them to the open path
     /// bracket, where fill and stroke wait for FILLPATH/STROKEPATH.
-    mutating func shape(_ ops: [Op], fill: Bool, stroke: Bool) {
-        let dev = ops.map { mapOp($0) }
+    mutating func shape(_ ops: consuming [Op], fill: Bool, stroke: Bool) {
+        // Maps in place: the caller's array becomes the device-space path, no second copy.
+        var dev = ops
+        for i in dev.indices { dev[i] = mapOp(dev[i]) }
         if inPath { return pushPathOps(dev) }
         if mixSkips(fill) || dev.count < 2 { return }
         let paint = fill ? fillPaint() : nil
@@ -894,5 +912,34 @@ extension Int {
     func addingSaturating(_ o: Int) -> Int {
         let (v, overflow) = addingReportingOverflow(o)
         return overflow ? (o > 0 ? .max : .min) : v
+    }
+}
+
+/// A set of object-table slots below `Metafile.maxObjects` (4096 = 64 × 64): one bit per slot and one summary bit
+/// per word, so the lowest member is two bit scans away. Stands in for WordCraft's `BTreeSet<usize>`.
+struct SlotSet {
+    private var words = [UInt64](repeating: 0, count: 64)
+    /// Bit `w` is set when `words[w]` is non-zero.
+    private var summary: UInt64 = 0
+
+    mutating func insert(_ i: Int) {
+        guard i >= 0, i < 4096 else { return }
+        words[i >> 6] |= 1 << UInt64(i & 63)
+        summary |= 1 << UInt64(i >> 6)
+    }
+
+    mutating func remove(_ i: Int) {
+        guard i >= 0, i < 4096 else { return }
+        words[i >> 6] &= ~(1 << UInt64(i & 63))
+        if words[i >> 6] == 0 { summary &= ~(1 << UInt64(i >> 6)) }
+    }
+
+    /// Removes and returns the lowest member.
+    mutating func popFirst() -> Int? {
+        guard summary != 0 else { return nil }
+        let w = summary.trailingZeroBitCount
+        let i = w << 6 | words[w].trailingZeroBitCount
+        remove(i)
+        return i
     }
 }

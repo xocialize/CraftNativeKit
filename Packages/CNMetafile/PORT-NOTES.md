@@ -23,11 +23,13 @@ for the `cg…` conveniences; nothing imports AppKit.
 | `EMFPlus.swift` | `emfplus.rs` | |
 | `ImageDecode.swift` | `emfplus.rs` `decode_compressed` | ImageIO instead of the `image` crate (see below). |
 | `Metafile.swift` | `lib.rs` | Entry points, the public model, `build`. |
-| `Place.swift` | `place.rs` | Placement, plus the kurbo pieces it uses (Affine, Rect, BezPath, cubic bounding boxes with `solve_quadratic`). |
+| `Place.swift` | `place.rs` | Placement, plus the kurbo pieces it uses (Affine, Rect, BezPath, cubic bounding boxes with `solve_quadratic`). WordCraft's `crop_window` and crop rule. |
+| `TextRun.swift` | WordCraft `lib.rs` `Text`, `place.rs` `Text::layout` | WordCraft's view of a text run, derived from `MetafileText` (see the WordCraft merge). |
 
 Tests: `RecordTests.swift`, `BitmapTextTests.swift`, `ClipPlusTests.swift` hold every test of `tests.rs` (108)
 and the four in-file tests of `clip.rs`, one Swift test per Rust test with the same name in camel case.
-`Support.swift` has the record builders. `OracleTests.swift` is the parity test (below).
+`Support.swift` has the record builders. `OracleTests.swift` is the parity test (below). `WordCraftTests.swift` holds
+the tests that exist only in WordCraft's crate (see the WordCraft merge).
 
 ## Public API
 
@@ -39,8 +41,11 @@ Metafile.maxBitmapSide: UInt32           // MAX_BITMAP_SIDE (30_000)
 
 MetafilePicture { width: Float, height: Float, items: [MetafileItem] }
   .hasSize: Bool
-  .fit(_ r: MetafileRect, crop: SIMD4<Float>) -> MetafileAffine?
-  .place(_ r: MetafileRect, crop: SIMD4<Float>) -> [MetafilePlacedItem]
+  .fit(_ r: MetafileRect, crop: SIMD4<Float>, rule: MetafileCropRule = .deckcraft) -> MetafileAffine?
+  .place(_ r: MetafileRect, crop: SIMD4<Float>, rule: MetafileCropRule = .deckcraft) -> [MetafilePlacedItem]
+MetafileCropRule: .deckcraft, .wordCraft
+Metafile.cropWindow(_ crop: SIMD4<Float>) -> SIMD4<Double>   // WordCraft's crop_window: [left, top, width, height]
+Metafile.minVisibleCrop: Double          // 0.005
 MetafileItem: .path(segs:fill:stroke:evenOdd:region:), .bitmap(rect:width:height:rgba:region:),
               .pattern(segs:evenOdd:tile:region:), .text(MetafileText)
   mutating .takePixels() -> (width: UInt32, height: UInt32, rgba: [UInt8])?
@@ -51,6 +56,12 @@ MetafileTile (final class: shared by fills of one brush; key a cache by ObjectId
 MetafileText { transform: [Double] (6, kurbo order), text, dx: [Float], font: MetafileFont, color,
                background: MetafileColor?, hAlign, vAlign, clip: SIMD4<Float>?, region: [SIMD4<Float>]? }
 MetafileFont { family, height, width: Float, weight: UInt16, italic, underline, strike, charset: UInt8 }
+MetafileText.run: MetafileTextRun?       // WordCraft's `Text`
+MetafileTextRun { text, x, y, size: Float, cell: Bool, font: String, bold, italic, color, angle: Float, hAlign, vAlign,
+                  dx: [Float] }
+  .placement(_ fit: MetafileAffine) -> MetafileAffine?        // WordCraft's PlacedItem::Text tf
+  .layout(upem:ascent:descent:glyphs:) -> MetafileTextLayout?  // glyphs: (cluster: UTF-8 offset, advance, xOffset, yOffset)
+MetafileTextLayout { em, baseline: Double, glyphs: [SIMD2<Double>] }
 MetafileColor = SIMD4<UInt8> (straight RGBA)
 
 MetafilePlacedItem:
@@ -122,3 +133,68 @@ PATH=/opt/homebrew/opt/rustup/bin:$PATH CARGO_TARGET_DIR=~/Library/Caches/DeckCr
   Both tests are ported in `ClipPlusTests`.
 - **No port needed:** f441ea93 (the Clippy split of `record`), checked arm by arm. The `emfplus.rs` change in
   505a6f28 is the same condition rewritten by De Morgan's law.
+
+## WordCraft merge (2026-11-01)
+
+deckcraft's `crates/metafile` forked from WordCraft's on 2026-10-12. WordCraft then landed five metafile commits that
+deckcraft has not taken (its `origin/main` doesn't have them either). They are ported here from the WordCraft checkout
+at `fd7f6621` (MIT OR Apache-2.0, © ArtCraft Team and the WordCraft contributors), so Marquee Documents draws
+metafiles the way WordCraft does while DeckCraftNative keeps deckcraft's output. Each changed file names its WordCraft
+source in its header.
+
+| WordCraft commit | What | Here |
+|---|---|---|
+| `45d2546b` | WMF handle table finds its lowest free slot without scanning | `Canvas.objects` keeps a free-slot set (`SlotSet`: 64 words of bits and a summary word, for the 4096-slot cap; WordCraft uses a `BTreeSet`). Same slots as the scan. |
+| `45d2546b` | Shape ops mapped in place | `Canvas.shape` takes its ops `consuming` and maps them in place. |
+| `45d2546b` | Cropped DIB decode (`decode_clip`) | `DIB.decodeClip` validates the whole DIB, then decodes only the rows and columns the source rectangle covers; the EMF and WMF blits use it. `DIB.clipRect` is the shared clip arithmetic. `decode` and `clipBlit` stay for pattern brushes and EMF+ images, so `Rgba.bottomUp` stays (WordCraft dropped it). Output unchanged: `prepare` is per pixel, so preparing the cropped part equals cropping the prepared whole. |
+| `6931b8db` | EMF text (EXTTEXTOUTW) | Reconciled, not duplicated: see below. |
+| `0cca2f7d`, `fc5063c3` | A sliver crop is drawn at the file's size, keeping at least 0.5% of an axis (`crop_window`) | `Metafile.cropWindow`, and `fit`/`place` take `rule: .wordCraft`. The default stays `.deckcraft` (sides clamped to 0–0.95, at least 5% shown). |
+| `c98efffc` | Empty polygon groups reserve nothing | `subpaths` reserves exactly the ops it emits. |
+
+**Text.** deckcraft's reader already parses every record the WordCraft commit reads (EXTCREATEFONTINDIRECTW,
+SETTEXTALIGN, SETTEXTCOLOR, EXTTEXTOUTW, the stock fonts, the DC stack) and more (EXTTEXTOUTA, SMALLTEXTOUT, WMF
+TEXTOUT/EXTTEXTOUT, the background, ETO_CLIPPED, clip regions). So there is one parser and one model (`MetafileText`),
+and `MetafileText.run` derives WordCraft's `Text` from it: the reference point and baseline angle from `transform`, the
+size as the font height times the scale across the baseline (a height of 0 is WordCraft's 16 units; positive is a cell
+height), advances times the scale along it, the face (Arial when none), bold from weight 600, and trailing NULs dropped
+with their advances. `MetafileTextRun.layout` is WordCraft's `Text::layout` (glyph clusters are UTF-8 byte offsets, as
+its shaper gives them) and `placement` is the transform WordCraft's `PlacedItem::Text` carries. Where the two readers
+still differ on the same file, deckcraft's behaviour is what the model holds:
+
+- **Text inside a path bracket** is drawn here; WordCraft drops it.
+- **TA_UPDATECP** moves the current point by the advance along the escapement and the alignment here (estimated from
+  the height without a dx array); WordCraft moves it by the dx sum along logical x only.
+- **Mirroring mappings.** Glyphs are never mirrored here (the baseline of an x-mirrored mapping runs left to right);
+  WordCraft's angle follows the device direction (π for an x-mirrored mapping).
+- **Non-uniform frames.** The run's angle is taken in picture space; WordCraft's is the device angle, which differs
+  when the frame scales x and y differently and the text is rotated.
+
+None of these has an option yet: each needs a parse option threaded through `Canvas`, and no WordCraft test covers
+them. Add one when Marquee Documents' layout parity needs it.
+
+**Byte budget.** WordCraft's `c98efffc` also makes `Canvas::push` charge each item's capacity rather than its length.
+Here items are still charged by length (deckcraft's rule, so the oracle's cut points hold). Rust's `Vec` growth slack
+can't be reproduced by Swift's arrays, so a capacity rule wouldn't give WordCraft's cut points either; exact-sized
+`subpaths` closes the hole the commit found (room reserved for empty groups that the budget never saw).
+
+**Tests.** WordCraft's crate has 65 tests; 57 share a name with deckcraft's and 8 are its own.
+
+- The 8 are in `WordCraftTests.swift`: `handleTablePicksTheSameSlotsAsTheFirstFreeScan`,
+  `creatingIntoAFullTableDoesNotScanIt`, `decodeClipMatchesDecodeThenClipBlit` (18,816 cases, bit-exact against
+  `decode` + `clipBlit`), `decodeClipRejectsWhatDecodeRejected`, `decodeClipDecodesOnlyTheCroppedPixels` (counted
+  through an `inout` counter instead of a thread-local), `cropWindowKeepsASliverAndStaysFinite`,
+  `theNarrowestCropOnTheLargestFrameKeepsItsContent` (both with `rule: .wordCraft`), `emptyPolyGroupsReserveNothing`
+  (Swift may round a reservation up to its allocation, so the capacity bounds are ≤ 8, not exact). Beside them:
+  `cropRulesDifferOnlyOnSlivers`, and four tests of the text run, its layout and its placement.
+- 48 shared tests have identical bodies. The other 9 (`wmfStretchdibFlipsBottomUpRows`,
+  `emfStretchdibitsFlipsAndFitsFrame`, `wmfStretchdibClippedSourceKeepsItsPlace`, `canvasStopsAtTheByteBudget`,
+  `wmfDibbitbltCopiesTheDibAtItsDestination`, `flipToleratesAShortPixelBuffer`,
+  `placeFitsTheFrameScalesStrokesAndDropsFarPaths`, `placeKeepsOnlyFiniteBoundedBitmapsWithArea`,
+  `takePixelsReturnsOnlyDrawableBitmaps`) differ only in fields WordCraft's model lacks (`region`, `bottom_up`); the
+  assertions are the same, so the existing Swift tests stand for both. The DIB ones now run through `decodeClip`, and
+  the two placement tests run under both crop rules.
+
+Receipts: `swift test --filter CNMetafileTests` passes all of them. `Tools/oracle/oracle.sh metafile-vectors`
+(deckcraft at the pin `a3fbf029`) regenerated into a scratch folder is byte-identical to the stored fixtures, and
+`metafileOracleParity` matches all 325 cases.
+

@@ -1,7 +1,8 @@
-// CNMetafile — WMF reader (MS-WMF). A file is an optional 22-byte placeable header, a 9-word standard header,
-// then records of (size in 16-bit words, function, parameters). Parameters are read at byte 6 of each record.
-// Port of deckcraft crates/metafile/src/wmf.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft
-// contributors).
+// CNMetafile — WMF reader (MS-WMF). A file is an optional 22-byte placeable header, a 9-word standard header, then
+// records of (size in 16-bit words, function, parameters). Parameters are read at byte 6 of each record. Port of
+// deckcraft crates/metafile/src/wmf.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors). DIB
+// blits decode only the cropped part, as WordCraft crates/metafile/src/wmf.rs at fd7f6621 (MIT OR Apache-2.0, ©
+// ArtCraft Team and the WordCraft contributors) does (45d2546b).
 import CNCore
 
 enum WMF {
@@ -320,11 +321,10 @@ enum WMF {
     /// The raster operation `rop` decides how the pixels combine (see `DIB.prepare`).
     private static func dibBlit(_ cv: inout Canvas, _ r: Bytes, _ at: Int, _ rop: UInt32, _ dst: R4, _ src: R4) {
         guard let dib = r.tail(at), let n = DIB.infoLen(dib), let info = dib.slice(0, n), let bits = dib.tail(n),
-              var img = DIB.decode(info, bits, keepAlpha: false)
+              case let s = [Int64(rustCast: src[0]), Int64(rustCast: src[1]), Int64(rustCast: src[2]), Int64(rustCast: src[3])],
+              case (var img, let d)? = DIB.decodeClip(info, bits, keepAlpha: false, s, dst)
         else { return }
         DIB.prepare(&img, .rop(rop))
-        let s = [Int64(rustCast: src[0]), Int64(rustCast: src[1]), Int64(rustCast: src[2]), Int64(rustCast: src[3])]
-        guard let (cropped, d) = DIB.clipBlit(img, s, dst) else { return }
-        cv.bitmap(d, cropped)
+        cv.bitmap(d, img)
     }
 }
