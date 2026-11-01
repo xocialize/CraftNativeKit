@@ -6,15 +6,19 @@ public struct JSONWriter: Sendable {
     /// Write NaN and ±infinity as `0.0` instead of `null`. deckcraft-format's `Finite` wrapper does this
     /// for saved files, because a `null` float doesn't read back.
     public var nonFiniteAsZero: Bool
+    /// `serde_json::to_vec_pretty`'s layout: two-space indents, `": "` after a key, a line per element, and an empty
+    /// array or object written `[]` / `{}`.
+    public var pretty: Bool
 
-    public init(nonFiniteAsZero: Bool = false) {
+    public init(nonFiniteAsZero: Bool = false, pretty: Bool = false) {
         self.nonFiniteAsZero = nonFiniteAsZero
+        self.pretty = pretty
     }
 
     public func bytes(_ value: JSON) -> [UInt8] {
         var out: [UInt8] = []
         out.reserveCapacity(1024)
-        write(value, into: &out)
+        write(value, into: &out, depth: 0)
         return out
     }
 
@@ -22,7 +26,12 @@ public struct JSONWriter: Sendable {
         String(decoding: bytes(value), as: UTF8.self)
     }
 
-    private func write(_ value: JSON, into out: inout [UInt8]) {
+    private func newline(_ depth: Int, into out: inout [UInt8]) {
+        out.append(0x0A)
+        out.append(contentsOf: repeatElement(UInt8(ascii: " "), count: 2 * depth))
+    }
+
+    private func write(_ value: JSON, into out: inout [UInt8], depth: Int) {
         switch value {
         case .null:
             out.append(contentsOf: "null".utf8)
@@ -50,17 +59,21 @@ public struct JSONWriter: Sendable {
             out.append(UInt8(ascii: "["))
             for (i, item) in items.enumerated() {
                 if i > 0 { out.append(UInt8(ascii: ",")) }
-                write(item, into: &out)
+                if pretty { newline(depth + 1, into: &out) }
+                write(item, into: &out, depth: depth + 1)
             }
+            if pretty && !items.isEmpty { newline(depth, into: &out) }
             out.append(UInt8(ascii: "]"))
         case .object(let o):
             out.append(UInt8(ascii: "{"))
             for (i, e) in o.entries.enumerated() {
                 if i > 0 { out.append(UInt8(ascii: ",")) }
+                if pretty { newline(depth + 1, into: &out) }
                 JSONWriter.writeString(e.key, into: &out)
-                out.append(UInt8(ascii: ":"))
-                write(e.value, into: &out)
+                out.append(contentsOf: pretty ? [UInt8(ascii: ":"), UInt8(ascii: " ")] : [UInt8(ascii: ":")])
+                write(e.value, into: &out, depth: depth + 1)
             }
+            if pretty && !o.entries.isEmpty { newline(depth, into: &out) }
             out.append(UInt8(ascii: "}"))
         }
     }

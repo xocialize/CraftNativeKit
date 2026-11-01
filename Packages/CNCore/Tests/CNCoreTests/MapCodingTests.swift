@@ -45,3 +45,28 @@ import Testing
         #expect((-0.25).remEuclid(1.0) == 0.75 && (1.25).remEuclid(1.0) == 0.25)
     }
 }
+
+/// `serde_json::to_vec_pretty`'s layout.
+@Suite struct PrettyJSONTests {
+    @Test func prettyMatchesSerdeJSON() throws {
+        let v = try JSONParser.parse(#"{"a":[1,{"b":[]},{}],"c":{"d":"x"},"e":[]}"#)
+        let expected = """
+            {
+              "a": [
+                1,
+                {
+                  "b": []
+                },
+                {}
+              ],
+              "c": {
+                "d": "x"
+              },
+              "e": []
+            }
+            """
+        #expect(JSONWriter(pretty: true).string(v) == expected)
+        #expect(JSONWriter(pretty: true).string(.array([])) == "[]")
+        #expect(JSONWriter().string(v) == #"{"a":[1,{"b":[]},{}],"c":{"d":"x"},"e":[]}"#)
+    }
+}
