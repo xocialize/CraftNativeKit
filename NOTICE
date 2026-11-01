@@ -1,0 +1,10 @@
+CraftNativeKit
+Copyright (c) 2026 Dustin Nielson.
+Licensed under the MIT License or the Apache License, Version 2.0, at your option
+(LICENSE-MIT, LICENSE-APACHE).
+
+CraftNativeKit holds code ported from DeckCraft (https://github.com/storytold/deckcraft) and PhotoCraft
+(https://github.com/storytold/photocraft), Copyright (c) 2026 ArtCraft Team and their contributors, used under the
+MIT License or the Apache License, Version 2.0. DeckCraft's licence texts and NOTICE are in LICENSES/deckcraft/;
+every ported file names its source file and licence in its header. CraftNativeKit is not made, sponsored or
+endorsed by the ArtCraft Team, and uses none of the ArtCraft marks.
