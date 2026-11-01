@@ -422,3 +422,105 @@ extension JSONFields {
         }
     }
 }
+
+// MARK: - Maps
+
+/// A `BTreeMap` key: serde_json writes it as a string (an integer key as its digits) and reads it back from one.
+public protocol JSONMapKey: Hashable, Sendable {
+    var jsonMapKey: String { get }
+    init(jsonMapKey: String) throws(JSONDecodeError)
+    /// `BTreeMap`'s order: integers by value, strings by their UTF-8 bytes.
+    static func rustLess(_ a: Self, _ b: Self) -> Bool
+}
+
+extension String: JSONMapKey {
+    public var jsonMapKey: String { self }
+    public init(jsonMapKey: String) { self = jsonMapKey }
+    public static func rustLess(_ a: String, _ b: String) -> Bool { a.utf8.lexicographicallyPrecedes(b.utf8) }
+}
+
+/// An integer key, read as serde_json reads one: a JSON integer inside the quotes, nothing around it.
+public protocol JSONIntegerMapKey: JSONMapKey, FixedWidthInteger, JSONDecodable {}
+
+extension JSONIntegerMapKey {
+    public var jsonMapKey: String { String(self) }
+    public init(jsonMapKey: String) throws(JSONDecodeError) {
+        let digits = jsonMapKey.utf8
+        guard let first = digits.first, first == UInt8(ascii: "-") || (first >= 0x30 && first <= 0x39),
+              let parsed = try? JSONParser.parse(jsonMapKey) else {
+            throw JSONDecodeError("invalid type: string \"\(jsonMapKey)\", expected an integer map key")
+        }
+        self = try Self(fromJSON: parsed)
+    }
+    public static func rustLess(_ a: Self, _ b: Self) -> Bool { a < b }
+}
+
+extension UInt8: JSONIntegerMapKey {}
+extension UInt16: JSONIntegerMapKey {}
+extension UInt32: JSONIntegerMapKey {}
+extension UInt64: JSONIntegerMapKey {}
+extension Int: JSONIntegerMapKey {}
+extension Int32: JSONIntegerMapKey {}
+extension Int64: JSONIntegerMapKey {}
+
+/// A `BTreeMap<K, V>`: an object with its keys in Rust's order.
+extension Dictionary: JSONEncodable where Key: JSONMapKey, Value: JSONEncodable {
+    public func toJSON() -> JSON {
+        var o = JSONObject()
+        for k in keys.sorted(by: Key.rustLess) {
+            if let v = self[k] { o.append(k.jsonMapKey, v.toJSON()) }
+        }
+        return .object(o)
+    }
+}
+
+/// A `BTreeMap<K, V>` read from an object; a repeated key keeps its last value, as `BTreeMap::insert` does.
+extension Dictionary: JSONDecodable where Key: JSONMapKey, Value: JSONDecodable {
+    public init(fromJSON json: JSON) throws(JSONDecodeError) {
+        guard case .object(let o) = json else { throw .invalidType(json, expected: "a map") }
+        var out: [Key: Value] = [:]
+        for e in o.entries {
+            out[try Key(jsonMapKey: e.key)] = try Value(fromJSON: e.value)
+        }
+        self = out
+    }
+}
+
+// MARK: - `#[serde(with = "…")]` fields
+
+extension JSONFields {
+    /// A required field read by a hand-written `with` module.
+    public func required<T>(_ key: String, with decode: (JSON) throws(JSONDecodeError) -> T) throws(JSONDecodeError) -> T {
+        guard let v = object[key] else { throw .missingField(key) }
+        do {
+            return try decode(v)
+        } catch {
+            throw JSONDecodeError("\(error.message) (field `\(key)`)")
+        }
+    }
+
+    /// A defaulted field read by a hand-written `with` module.
+    public func get<T>(_ key: String, default fallback: @autoclosure () -> T, with decode: (JSON) throws(JSONDecodeError) -> T) throws(JSONDecodeError) -> T {
+        guard let v = object[key] else { return fallback() }
+        do {
+            return try decode(v)
+        } catch {
+            throw JSONDecodeError("\(error.message) (field `\(key)`)")
+        }
+    }
+}
+
+// MARK: - char
+
+/// Rust's `char`: serde writes it as a one-character string and reads only that.
+extension Unicode.Scalar: JSONCodable {
+    public func toJSON() -> JSON { .string(String(self)) }
+    public init(fromJSON json: JSON) throws(JSONDecodeError) {
+        guard case .string(let s) = json else { throw .invalidType(json, expected: "a character") }
+        var it = s.unicodeScalars.makeIterator()
+        guard let c = it.next(), it.next() == nil else {
+            throw JSONDecodeError("invalid value: string \"\(s)\", expected a character")
+        }
+        self = c
+    }
+}

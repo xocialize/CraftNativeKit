@@ -41,6 +41,13 @@ extension Double {
         truncatingRemainder(dividingBy: divisor)
     }
 
+    /// Rust's `f64::rem_euclid`: `self % rhs`, moved up by `|rhs|` when negative (it can round up to `|rhs|`).
+    @inlinable
+    public func remEuclid(_ rhs: Double) -> Double {
+        let r = truncatingRemainder(dividingBy: rhs)
+        return r < 0 ? r + abs(rhs) : r
+    }
+
     /// Rust's `f64::max` on Apple silicon (`fmaxnm`): a NaN operand is ignored, and +0 is above −0.
     @inlinable
     public func rustMax(_ other: Double) -> Double {
