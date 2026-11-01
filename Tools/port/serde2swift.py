@@ -493,11 +493,18 @@ def emit_id(it, out):
 
 
 def variant_json_name(v, rename):
-    return camel_variant(v.name) if rename else v.name
+    """A variant's JSON name under the enum's `rename_all` (None, "camelCase" or "lowercase")."""
+    if rename == "camelCase":
+        return camel_variant(v.name)
+    if rename == "lowercase":
+        return v.name.lower()
+    if rename:
+        raise ValueError(f"rename_all = {rename!r} on an enum is not supported")
+    return v.name
 
 
 def emit_enum(it, out):
-    rename = it.serde.get("rename_all") == "camelCase"
+    rename = it.serde.get("rename_all")
     tag, content = it.serde.get("tag"), it.serde.get("content")
     all_unit = all(v.shape == "unit" for v in it.variants)
     default_v = next((v for v in it.variants if v.is_default), None)

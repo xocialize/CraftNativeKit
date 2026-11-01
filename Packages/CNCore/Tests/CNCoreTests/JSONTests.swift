@@ -160,5 +160,16 @@ private func lines(_ name: String) throws -> [(Substring, Substring)] {
         #expect((-0.0).rustMax(0.0).sign == .plus)
         #expect(Double.nan.rustMax(2) == 2 && (3.0).rustMin(.nan) == 3)
         #expect((-7.5).rem(2) == -1.5)
+        // The same for f32.
+        #expect(Float(0).rustMin(-0.0).sign == .minus)
+        #expect(Float(-0.0).rustMax(0).sign == .plus)
+        #expect(Float.nan.rustMax(2) == 2 && Float(3).rustMin(.nan) == 3)
+        #expect(Float(-7.5).rem(2) == -1.5)
+        #expect(Float(-30).remEuclid(360) == 330 && Float(725).remEuclid(-360) == 5)
+        #expect(Float(-1e-8).remEuclid(360) == 360, "rounds up to the divisor, as Rust's does")
+        #expect(Float(-0.0).rustSignum == -1 && Float.nan.rustSignum.isNaN)
+        // Bit patterns from rustc 1.99.1's `to_radians` and `to_degrees`.
+        #expect([Float(180), 1, 359].map(\.toRadians.bitPattern) == [0x4049_0FDB, 0x3C8E_FA35, 0x40C8_80E0])
+        #expect([Float(180), 1, 359].map { $0.toRadians.toDegrees.bitPattern } == [0x4334_0000, 0x3F80_0000, 0x43B3_8000])
     }
 }

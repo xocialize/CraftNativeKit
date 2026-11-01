@@ -81,6 +81,51 @@ extension Float {
         if x > hi { x = hi }
         return x
     }
+
+    /// Rust's `%` on `f32` (C `fmodf`): the result has the sign of the dividend.
+    @inlinable
+    public func rem(_ divisor: Float) -> Float {
+        truncatingRemainder(dividingBy: divisor)
+    }
+
+    /// Rust's `f32::rem_euclid`: `self % rhs`, moved up by `|rhs|` when negative. It can round up to
+    /// `|rhs|` itself for tiny negative values, as Rust's does.
+    @inlinable
+    public func remEuclid(_ rhs: Float) -> Float {
+        let r = truncatingRemainder(dividingBy: rhs)
+        return r < 0 ? r + abs(rhs) : r
+    }
+
+    /// Rust's `f32::max` on Apple silicon (`fmaxnm`): a NaN operand is ignored, and +0 is above −0.
+    @inlinable
+    public func rustMax(_ other: Float) -> Float {
+        if isNaN { return other }
+        if other.isNaN { return self }
+        if self == other { return sign == .minus ? other : self }
+        return self > other ? self : other
+    }
+
+    /// Rust's `f32::min` on Apple silicon (`fminnm`): a NaN operand is ignored, and −0 is below +0.
+    @inlinable
+    public func rustMin(_ other: Float) -> Float {
+        if isNaN { return other }
+        if other.isNaN { return self }
+        if self == other { return sign == .minus ? self : other }
+        return self < other ? self : other
+    }
+
+    /// Rust's `f32::signum`: ±1 by the sign bit (so ±0 give ±1), NaN for NaN.
+    @inlinable
+    public var rustSignum: Float { isNaN ? .nan : (sign == .minus ? -1.0 : 1.0) }
+
+    /// Rust's `f32::to_radians` (`self * (PI / 180.0)`, in `f32`).
+    @inlinable
+    public var toRadians: Float { self * (Float.pi / 180.0) }
+
+    /// Rust's `f32::to_degrees`: `self` times 180/π rounded to `f32` once (not `180.0 / PI` in `f32`, which
+    /// is an ulp off).
+    @inlinable
+    public var toDegrees: Float { self * 57.2957795130823208767981548141051703 }
 }
 
 extension Collection {
