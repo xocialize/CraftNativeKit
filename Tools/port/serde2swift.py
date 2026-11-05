@@ -200,18 +200,22 @@ def leading_meta(seg):
     return docs, " ".join(attrs), "\n".join(rest).strip()
 
 
-def parse_type(t):
+def parse_type(t, skipped=False):
+    """`skipped`: the field is `#[serde(skip)]`, so it is never written and its order can't matter: unordered
+    collections (`HashMap`, `HashSet`, `BTreeSet`) are allowed there, as Swift `Dictionary` and `Set`."""
     t = t.strip()
     t = re.sub(r"\s+", " ", t)
     if t.startswith("(") and t.endswith(")"):
-        return ("tuple", [parse_type(x) for x in split_top(t[1:-1])])
+        return ("tuple", [parse_type(x, skipped) for x in split_top(t[1:-1])])
     if t.startswith("[") and t.endswith("]"):
         inner, n = t[1:-1].rsplit(";", 1)
-        return ("fixed", parse_type(inner), int(n.strip()))
+        return ("fixed", parse_type(inner, skipped), int(n.strip()))
+    if t == "serde_json::Value":
+        return ("named", "JSON")
     m = re.match(r"^([A-Za-z_][\w:]*)\s*<(.*)>$", t)
     if m:
         head = m.group(1).split("::")[-1]
-        args = [parse_type(x) for x in split_top(m.group(2))]
+        args = [parse_type(x, skipped) for x in split_top(m.group(2))]
         if head == "Vec":
             return ("vec", args[0])
         if head == "Option":
@@ -222,8 +226,12 @@ def parse_type(t):
             return args[0]
         if head == "BTreeMap":
             return ("map", args[0], args[1])
+        if skipped and head == "HashMap":
+            return ("map", args[0], args[1])
+        if skipped and head in ("HashSet", "BTreeSet"):
+            return ("set", args[0])
         if head in ("HashMap", "HashSet", "BTreeSet"):
-            raise ValueError(f"unsupported generic {t}")
+            raise ValueError(f"unsupported generic {t} (allowed only on a #[serde(skip)] field)")
         return ("generic", head, args)
     name = t.split("::")[-1]
     if name in PRIMS:
@@ -254,6 +262,8 @@ def swift_type(ty):
         return f"[{swift_type(ty[1])}]"
     if k == "fixed":
         return f"[{swift_type(ty[1])}]"
+    if k == "set":
+        return f"Set<{swift_type(ty[1])}>"
     if k == "opt":
         inner = swift_type(ty[1])
         return f"{inner}?"
@@ -264,7 +274,7 @@ def swift_type(ty):
 
 
 # Defaults of types from other modules (no `.default` there).
-EXTERNAL_DEFAULTS = {"Xfrm": "Xfrm()", "Size": "Size.zero", "Rect": "Rect.zero", "Point": "Point.zero", "Rgba": "Rgba.black"}
+EXTERNAL_DEFAULTS = {"JSON": "JSON.null", "Xfrm": "Xfrm()", "Size": "Size.zero", "Rect": "Rect.zero", "Point": "Point.zero", "Rgba": "Rgba.black"}
 
 
 def default_expr(ty):
@@ -281,7 +291,7 @@ def default_expr(ty):
         if ty[1] in ALIASES:
             return default_expr(ALIASES[ty[1]])
         return EXTERNAL_DEFAULTS.get(ty[1], f"{ty[1]}.default")
-    if k == "vec":
+    if k in ("vec", "set"):
         return "[]"
     if k == "opt":
         return "nil"
@@ -332,7 +342,8 @@ def parse_fields(body):
             continue
         decl = re.sub(r"^pub(\([^)]*\))?\s+", "", decl)
         name, ty = decl.split(":", 1)
-        fields.append(Field(name.strip(), parse_type(ty), docs, attrs))
+        skipped = parse_serde_attrs(attrs).get("skip") is True
+        fields.append(Field(name.strip(), parse_type(ty, skipped), docs, attrs))
     return fields
 
 
