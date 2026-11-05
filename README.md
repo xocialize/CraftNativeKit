@@ -5,7 +5,8 @@ The base packages the native Swift ports of the storytold Crafting Apps share. m
 | Product | What it is | First written for |
 |---|---|---|
 | `CNCore` | serde_json-exact JSON (value, writer, parser, serde-derive coding) and Rust's numeric and string semantics | DeckCraftNative, Wave 1 |
-| `CNZip` | ZIP read and write, ZIP64 included; raw DEFLATE through the Compression framework | PhotoCraftNative, then DeckCraftNative |
+| `CNZip` | ZIP read and write, ZIP64 included; raw DEFLATE through the Compression framework; the Rust `zip` crate's header fields on request | PhotoCraftNative, then DeckCraftNative |
+| `CNXML` | quick-xml 0.41.0 as the ports configure it: the event reader, namespace resolution and the writer, byte for byte | GridCraftNative (xlsx), from DeckCraftNative's DCPPTX reader |
 | `CNCFB` | The Compound File Binary format ([MS-CFB]), read and written | DeckCraftNative (legacy `.ppt`, encryption) |
 | `CNOffCrypto` | Password-protected OOXML ([MS-OFFCRYPTO]): Agile and Standard, read and written | DeckCraftNative |
 | `CNMetafile` | EMF, EMF+ and WMF read into a neutral vector model | DeckCraftNative (deckcraft-metafile, itself from WordCraft) |
@@ -16,6 +17,7 @@ generated files import `CNCore`.
 ## Consumers
 
 - [DeckCraftNative](https://github.com/xocialize/DeckCraftNative): the deckcraft port.
+- [GridCraftNative](https://github.com/xocialize/GridCraftNative): the gridcraft port.
 - [Marquee Documents](https://github.com/Mountain-View-Staging/MarqueeDocuments): the WordCraft port.
 
 Depend on it by URL:
@@ -42,7 +44,8 @@ swift test
 
 Some tests read vectors written by DeckCraftNative's oracle tools (serde_json's floats, Rust's float Display,
 deckcraft-metafile's dumps, the legacy and encrypted files). They look in `CRAFTNATIVEKIT_FIXTURES`, then
-`DECKCRAFT_FIXTURES`, then `../DeckCraftNative-Fixtures`. Each package's `PORT-NOTES.md` says how its vectors are made.
+`DECKCRAFT_FIXTURES`, then `../DeckCraftNative-Fixtures`. CNXML's vectors come from GridCraftNative's
+`Tools/oracle/oracle.sh xml-vectors` (`GRIDCRAFT_FIXTURES`, then `../GridCraftNative-Fixtures`). Each package's `PORT-NOTES.md` says how its vectors are made.
 
 ## Licence
 

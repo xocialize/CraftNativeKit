@@ -8,6 +8,40 @@ import Testing
 @testable import CNZip
 
 @Suite struct ZipTests {
+    /// `.rustZip` headers are the Rust `zip` crate 3's as gridcraft's XLSX writer sets them (measured on its output:
+    /// made by 0x314, version 20, no flags, DEFLATE, 1980-01-01, external attributes 0x81A40000, no extra fields).
+    @Test func rustZipHeaders() throws {
+        var w = ZipWriter(headers: .rustZip)
+        try w.addDeflated("[Content_Types].xml", Array("<Types/>".utf8))
+        try w.addDeflated("xl/é.xml", [])
+        try w.addStored("raw.bin", [1, 2, 3], crc: CRC32.checksum([1, 2, 3]))
+        let z = try w.finish()
+        func u16(_ i: Int) -> Int { Int(z[i]) | Int(z[i + 1]) << 8 }
+        func u32(_ i: Int) -> Int { u16(i) | u16(i + 2) << 16 }
+        let eocd = z.count - 22
+        #expect(u32(eocd) == 0x0605_4B50)
+        var at = u32(eocd + 16)
+        var seen: [(String, Int, Int, Int, Int, Int, Int, Int, Int, Int, Int)] = []
+        for _ in 0 ..< u16(eocd + 10) {
+            let n = u16(at + 28)
+            let name = String(decoding: z[at + 46 ..< at + 46 + n], as: UTF8.self)
+            let local = u32(at + 42)
+            seen.append((name, u16(at + 4), u16(at + 6), u16(at + 8), u16(at + 10), u16(at + 12), u16(at + 14),
+                         u32(at + 38), u16(at + 30), u16(local + 4), u16(local + 28)))
+            at += 46 + n + u16(at + 30) + u16(at + 32)
+        }
+        #expect(seen.map(\.0) == ["[Content_Types].xml", "xl/é.xml", "raw.bin"])
+        #expect(seen.map(\.1) == [0x314, 0x314, 0x30A]) // made by
+        #expect(seen.map(\.2) == [20, 20, 10]) // needed
+        #expect(seen.map(\.3) == [0, 0x800, 0]) // flags: UTF-8 only for a non-ASCII name
+        #expect(seen.map(\.4) == [8, 8, 0])
+        #expect(seen.allSatisfy { $0.5 == 0 && $0.6 == 0x21 && $0.7 == 0x81A4_0000 && $0.8 == 0 && $0.10 == 0 })
+        #expect(seen.map(\.9) == [20, 20, 10]) // the local header's version needed
+        let r = try ZipReader(z)
+        #expect(try r.read(named: "xl/é.xml", max: 10) == [])
+        #expect(try r.read(named: "[Content_Types].xml", max: 100) == Array("<Types/>".utf8))
+    }
+
     @Test func crcKnownValue() {
         #expect(CRC32.checksum(Array("123456789".utf8)) == 0xCBF4_3926)
     }

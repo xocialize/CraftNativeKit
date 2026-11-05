@@ -24,6 +24,7 @@ let package = Package(
         .library(name: "CNCFB", targets: ["CNCFB"]),
         .library(name: "CNOffCrypto", targets: ["CNOffCrypto"]),
         .library(name: "CNMetafile", targets: ["CNMetafile"]),
+        .library(name: "CNXML", targets: ["CNXML"]),
     ],
     targets: [
         // MARK: CNCore — serde_json-compatible JSON (value, writer, parser, serde-style coding) and Rust's numeric and
@@ -50,6 +51,12 @@ let package = Package(
         // from WordCraft's).
         .target(name: "CNMetafile", dependencies: ["CNCore"], path: sources("CNMetafile", "CNMetafile")),
         .testTarget(name: "CNMetafileTests", dependencies: ["CNMetafile", "CNCore", "CNTestSupport"], path: tests("CNMetafile", "CNMetafileTests")),
+
+        // MARK: CNXML — quick-xml 0.41.0 reproduced over bytes: the pull reader and its errors, namespace resolution and
+        // the event writer (GridCraftNative's xlsx; DeckCraftNative's XML reader is the same tokenizer). No
+        // dependencies.
+        .target(name: "CNXML", path: sources("CNXML", "CNXML")),
+        .testTarget(name: "CNXMLTests", dependencies: ["CNXML", "CNTestSupport"], path: tests("CNXML", "CNXMLTests")),
 
         // MARK: CNTestSupport — where the tests find their fixtures. Not a product.
         .target(name: "CNTestSupport", path: sources("CNTestSupport", "CNTestSupport")),

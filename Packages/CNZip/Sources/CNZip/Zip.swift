@@ -40,6 +40,16 @@ private let versionZip64: UInt16 = 45
 
 // MARK: - Layout
 
+/// How a writer fills an entry's version, flag and attribute fields. The layout, sizes and ZIP64 rules are the same.
+public enum ZipHeaders: Sendable {
+    /// photocraft's: version 2.0 made by MS-DOS, the UTF-8 flag on every name, no attributes.
+    case classic
+    /// The Rust `zip` crate 3's with its default options (gridcraft's XLSX writer, `crates/xlsx/src/package.rs`,
+    /// MIT OR Apache-2.0): made by Unix, version 2.0 for DEFLATE and 1.0 for STORE, the UTF-8 flag only on a name
+    /// that isn't ASCII, and mode 0644 in the external attributes.
+    case rustZip
+}
+
 /// The records both writers produce: each entry's local header and central directory entry, and
 /// the end records. Holds the central directory until the archive is finished.
 struct ZipLayout: Sendable {
@@ -53,8 +63,12 @@ struct ZipLayout: Sendable {
     private(set) var count = 0
     var entryUsedZip64 = false
     let forceZip64: Bool
+    let headers: ZipHeaders
 
-    init(forceZip64: Bool) { self.forceZip64 = forceZip64 }
+    init(forceZip64: Bool, headers: ZipHeaders = .classic) {
+        self.forceZip64 = forceZip64
+        self.headers = headers
+    }
 
     /// Where entry `index` is, read back from its central directory entry as `entry` wrote it: a size or offset is
     /// in the ZIP64 field (sizes first) exactly when its classic field holds `max32`, and the local header has a
@@ -94,14 +108,17 @@ struct ZipLayout: Sendable {
         // one carries the sizes and the offset that overflow, in that order.
         let sizes64 = forceZip64 || usize >= max32 || csize >= max32
         let offset64 = forceZip64 || offset >= max32
-        let needed = sizes64 || offset64 ? versionZip64 : versionClassic
+        let rust = headers == .rustZip
+        let base: UInt16 = rust && method == 0 ? 10 : versionClassic
+        let needed = sizes64 || offset64 ? versionZip64 : base
         if sizes64 || offset64 { entryUsedZip64 = true }
+        let flags: UInt16 = !rust || nameBytes.contains(where: { $0 >= 0x80 }) ? 0x0800 : 0
         // Local file header.
         var out: [UInt8] = []
         out.reserveCapacity(30 + nameBytes.count + 20)
         le32(&out, localSignature)
-        le16(&out, sizes64 ? versionZip64 : versionClassic) // version needed
-        le16(&out, 0x0800) // flags: UTF-8 names
+        le16(&out, sizes64 ? versionZip64 : base) // version needed
+        le16(&out, flags) // bit 11: a UTF-8 name
         le16(&out, method)
         le16(&out, 0) // time
         le16(&out, 0x21) // date: 1980-01-01
@@ -121,9 +138,9 @@ struct ZipLayout: Sendable {
         count += 1
         let extraLength = (sizes64 ? 16 : 0) + (offset64 ? 8 : 0)
         le32(&central, centralSignature)
-        le16(&central, needed) // made by (MS-DOS attributes, this spec version)
+        le16(&central, rust ? 0x0300 | needed : needed) // made by: Unix or MS-DOS attributes, this spec version
         le16(&central, needed)
-        le16(&central, 0x0800)
+        le16(&central, flags)
         le16(&central, method)
         le16(&central, 0)
         le16(&central, 0x21)
@@ -133,7 +150,7 @@ struct ZipLayout: Sendable {
         le16(&central, UInt16(nameBytes.count))
         le16(&central, extraLength == 0 ? 0 : UInt16(4 + extraLength))
         central += [UInt8](repeating: 0, count: 6) // comment len, disk, internal attrs
-        le32(&central, 0) // external attrs
+        le32(&central, rust ? 0o100644 << 16 : 0) // external attrs: a regular file, rw-r--r--
         le32(&central, offset64 ? UInt32(max32) : UInt32(offset))
         central += nameBytes
         if extraLength > 0 {
@@ -222,7 +239,9 @@ public struct ZipWriter: Sendable {
 
     /// `forceZip64` writes every ZIP64 field (each size and offset, and the ZIP64 end records) even
     /// where the classic one fits: for tests and interop checks of small archives.
-    public init(forceZip64: Bool = false) { layout = ZipLayout(forceZip64: forceZip64) }
+    public init(forceZip64: Bool = false, headers: ZipHeaders = .classic) {
+        layout = ZipLayout(forceZip64: forceZip64, headers: headers)
+    }
 
     /// Bytes written so far (local headers and data).
     public var size: Int { out.count }
@@ -260,6 +279,11 @@ public struct ZipWriter: Sendable {
         } else {
             try append(name, data, method: 0, crc: crc, uncompressedSize: data.count)
         }
+    }
+
+    /// Adds a DEFLATE entry, even when that makes it larger (as the Rust `zip` crate does).
+    public mutating func addDeflated(_ name: String, _ data: [UInt8]) throws {
+        try append(name, try Deflate.deflate(data), method: 8, crc: CRC32.checksum(data), uncompressedSize: data.count)
     }
 
     /// Adds a STORE entry whose CRC-32 the caller already has (computed in parallel, or kept from

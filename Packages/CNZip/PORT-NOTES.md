@@ -9,6 +9,12 @@
 
 - **Writing:** STORE, or DEFLATE when it saves space (`add(_:_:compress:)`). Classic layout, with ZIP64 only
   when an archive needs it.
+- **Rust `zip` headers** (0.6.0, for GridCraftNative's XLSX writer): `ZipWriter(headers: .rustZip)` fills the
+  version, flag and attribute fields as the Rust `zip` crate 3 does with default options (made by Unix 2.0, version
+  2.0 for DEFLATE and 1.0 for STORE, the UTF-8 flag only on a non-ASCII name, mode 0644), and `addDeflated` always
+  deflates, as that crate does. Measured on gridcraft's output (`rustZipHeaders`). The DEFLATE streams are still
+  Compression's, not zlib-rs's, so the bytes inside differ (GridCraftNative decision 8). ZIP64 follows this
+  package's rules, not the crate's, so archives past 4 GiB or 65,535 entries can differ in their ZIP64 fields.
 - **Reading:** STORE and DEFLATE, CRC-checked, bounded by `max`. With duplicate names, `find` returns the
   *first* entry. DCFormat looks entries up last-wins, as the Rust `zip` crate does.
 - **Two-way fixes:** a fix made here should go to PhotoCraftNative too, and the other way round.
