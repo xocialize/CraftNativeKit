@@ -13,3 +13,6 @@ Shared base packages for DeckCraftNative and Marquee Documents. [README.md](READ
   readers (`check-cfb-writer.sh`, `check-encrypt.sh`) live there too and run `swift test` in this repo.
 - **serde2swift.py** writes `import CNCore`. A consumer's `Tools/port/generate.sh` runs it from this checkout
   (`../CraftNativeKit`) or from `.build/checkouts/CraftNativeKit`.
+  Run `python3 -I Tools/port/test_serde2swift.py` after changing it, and regenerate every consumer
+  (DeckCraftNative, Marquee Documents, GridCraftNative) with the old and the new script into scratch copies:
+  output that no flag asked to change must stay byte-identical.

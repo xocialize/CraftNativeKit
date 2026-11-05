@@ -7,7 +7,9 @@ Every `#[derive(... Serialize ...)]` struct and enum in the given files becomes 
 `toJSON()` / `init(fromJSON:)` that follow its serde attributes exactly (CNCore's JSON layer):
 
 - structs: field order, `rename_all = "camelCase"`, struct- and field-level `default` (including
-  `default = "fn"`), `skip_serializing_if`, `skip`, `deserialize_with`;
+  `default = "fn"`), `skip_serializing_if`, `skip`, `skip_serializing` and `skip_deserializing` on their own,
+  `deserialize_with` (the hand-written function is named by the path's last segment), and `flatten` on a
+  field whose type is an object (its entries are written in the field's place; it reads the whole object);
 - enums: bare-string unit enums, externally, internally (`tag`) and adjacently (`tag` + `content`)
   tagged enums, with struct-variant fields keeping their Rust names (serde's `rename_all` on an
   enum renames variants only; one on a variant renames its fields);
@@ -26,13 +28,19 @@ allocation per value on a hot path. Use it when the recursion already goes throu
 `--box Indirect` maps `Box<T>` to `Indirect<T>` (a hand-written wrapper that lets value types recurse);
 without it `Box<T>` is `T`.
 
+`--arc Shared=Formula,PyCode` keeps an `Arc<Formula>` or `Option<Arc<Formula>>` struct field behind a shared box:
+the struct stores `formulaBox: Shared<Formula>?` (internal, `@usableFromInline`, after the other stored fields, so
+a pointer doesn't follow a small field) and shows `formula: Formula?` as a computed property, so copying the struct shares the value the way cloning an `Arc` does, and the struct stays as
+small as the Rust one. `Shared` is hand-written: an immutable final class with `init(_:)` and `value`, `Equatable`
+(and `Hashable`, for a type deriving `Hash`) by value where `T` is. Without `--arc`, `Arc<T>` is `T`.
+
 Behaviour (`impl` blocks) is not generated: it is ported by hand beside the generated file. Types
 that need hand-written pieces declare them by name, and the Swift compiler reports any missing:
 `static var default` for a manual `impl Default`, the Swift for each custom `skip_serializing_if`
 predicate or `default = "fn"` (see the tables below).
 
 Rust → Swift: f64 Double, f32 Float, integers by width (usize Int), Vec<T> [T], Option<T> T?,
-Box/Arc<T> T, [T; N] [T] (length checked on read), tuples Pair/Triple, paths by their last segment.
+Box/Arc<T> T (see `--box`, `--arc`), [T; N] [T] (length checked on read), tuples Pair/Triple, paths by their last segment.
 A Rust variant `None` becomes Swift `none_`, so it can't be confused with `Optional.none`, and `Default`
 becomes `default_`.
 """
@@ -222,6 +230,8 @@ def parse_type(t, skipped=False):
             return ("opt", args[0])
         if head == "Box" and BOX_TYPE:
             return ("box", args[0])
+        if head == "Arc" and args[0][0] == "named" and args[0][1] in ARC_TYPES:
+            return ("arc", args[0][1])
         if head in ("Box", "Arc", "Rc"):
             return args[0]
         if head == "BTreeMap":
@@ -240,6 +250,8 @@ def parse_type(t, skipped=False):
 
 
 BOX_TYPE = None
+# `--arc Wrapper=A,B`: `Arc<A>` struct fields stored as `Wrapper<A>` behind a computed `A` (inner type → wrapper).
+ARC_TYPES = {}
 # `--direct Name`: enums emitted without `indirect` (their recursion goes through a boxed or array type).
 DIRECT_ENUMS = set()
 # `pub type X = T;` across all the files, so defaults see through them.
@@ -254,6 +266,8 @@ def swift_type(ty):
         return f"{ty[1]}<{', '.join(swift_type(a) for a in ty[2])}>"
     if k == "box":
         return f"{BOX_TYPE}<{swift_type(ty[1])}>"
+    if k == "arc":
+        return ty[1]  # the public, computed type; the stored box is `storage_type`
     if k == "prim":
         return PRIMS[ty[1]]
     if k == "named":
@@ -273,6 +287,31 @@ def swift_type(ty):
     raise ValueError(ty)
 
 
+def arc_field(ty):
+    """`(wrapper, inner, optional)` for an `Arc<T>` or `Option<Arc<T>>` field under `--arc`, else None."""
+    if ty[0] == "arc":
+        return ARC_TYPES[ty[1]], ty[1], False
+    if ty[0] == "opt" and ty[1][0] == "arc":
+        return ARC_TYPES[ty[1][1]], ty[1][1], True
+    return None
+
+
+def contains_arc(ty):
+    if ty[0] == "arc":
+        return True
+    parts = []
+    for x in ty[1:]:
+        parts += x if isinstance(x, list) else [x]
+    return any(isinstance(x, tuple) and contains_arc(x) for x in parts)
+
+
+def refuse_arc(owner, types):
+    """`--arc` boxes struct fields only: elsewhere an `Arc<T>` of a listed type would silently go inline."""
+    for t in types:
+        if contains_arc(t):
+            raise ValueError(f"{owner}: --arc type in a position other than a struct field `Arc<T>` or `Option<Arc<T>>`")
+
+
 # Defaults of types from other modules (no `.default` there).
 EXTERNAL_DEFAULTS = {"JSON": "JSON.null", "Xfrm": "Xfrm()", "Size": "Size.zero", "Rect": "Rect.zero", "Point": "Point.zero", "Rgba": "Rgba.black"}
 
@@ -285,6 +324,8 @@ def default_expr(ty):
         return f"{swift_type(ty)}.default"
     if k == "box":
         return f"{BOX_TYPE}({default_expr(ty[1])})"
+    if k == "arc":
+        return default_expr(("named", ty[1]))
     if k == "prim":
         return {"bool": "false", "String": '""'}.get(ty[1], "0")
     if k == "named":
@@ -332,6 +373,8 @@ class Field:
         self.plain = camel_field(name)
         # Labels at a call site take keywords as they are, except these three (declarations keep backticks).
         self.label = self.swift if self.plain in ("inout", "var", "let") else self.plain
+        if self.serde.get("flatten") and (ty[0] != "named" or len(self.serde) > 1):
+            raise ValueError(f"{name}: #[serde(flatten)] is supported on a plain struct or enum field only")
 
 
 def parse_fields(body):
@@ -482,10 +525,14 @@ def field_key(f, rename):
 def decode_field(f, rename, struct_default, var="f"):
     key = field_key(f, rename)
     s = f.serde
+    if s.get("flatten"):
+        # serde hands the flattened field the entries the other fields don't take; it ignores the rest.
+        return f"try {swift_type(f.ty)}(fromJSON: .object({var}.object))"
     if "deserialize_with" in s:
         fallback = f"d.{f.plain}" if struct_default else default_expr(f.ty)
-        return f"try {camel_field(s['deserialize_with'])}({var}.object[\"{key}\"], default: {fallback})"
-    if s.get("skip"):
+        fn = camel_field(s['deserialize_with'].split('::')[-1])
+        return f"try {fn}({var}.object[\"{key}\"], default: {fallback})"
+    if s.get("skip") or s.get("skip_deserializing"):
         if isinstance(s.get("default"), str):
             return default_fn(s["default"])
         return f"d.{f.plain}" if struct_default else default_expr(f.ty)
@@ -530,8 +577,10 @@ def decode_field(f, rename, struct_default, var="f"):
 
 
 def encode_field(f, rename, var, out="o"):
-    if f.serde.get("skip"):
+    if f.serde.get("skip") or f.serde.get("skip_serializing"):
         return None
+    if f.serde.get("flatten"):
+        return f"if case .object(let inner) = {var}.toJSON() {{ {out}.merge(inner) }}"
     key = field_key(f, rename)
     pred = f.serde.get("skip_serializing_if")
     if "with" in f.serde:
@@ -555,8 +604,19 @@ def emit_struct(it, out):
     out += doc_lines(it.docs)
     out.append(f"public struct {type_decl(it)}: {', '.join(conformances(it))} {{")
     for f in it.fields:
+        if contains_arc(f.ty) and not arc_field(f.ty):
+            refuse_arc(f"{it.name}.{f.rust}", [f.ty])
+        if arc_field(f.ty):
+            continue
         out += doc_lines(f.docs, "    ")
         out.append(f"    public var {f.swift}: {swift_type(f.ty)}")
+    # The boxes are stored last: Swift lays fields out in declaration order (Rust reorders them), and a pointer
+    # after a small field pads. A cell (`Value`, a style id, two boxes) is 48 bytes this way and 56 in Rust's order.
+    for f in it.fields:
+        arc = arc_field(f.ty)
+        if arc:
+            wrapper, inner, optional = arc
+            out.append(f"    @usableFromInline var {f.plain}Box: {wrapper}<{inner}>{'?' if optional else ''}")
     # memberwise init: defaults when the type derives Default; optionals default to nil
     params = []
     for f in it.fields:
@@ -570,8 +630,26 @@ def emit_struct(it, out):
     out.append("")
     out.append(f"    public init({', '.join(params)}) {{")
     for f in it.fields:
-        out.append(f"        self.{f.plain} = {f.swift}")
+        arc = arc_field(f.ty)
+        if arc:
+            wrapper, _, optional = arc
+            value = f"{f.swift}.map {{ {wrapper}($0) }}" if optional else f"{wrapper}({f.swift})"
+            out.append(f"        self.{f.plain}Box = {value}")
+        else:
+            out.append(f"        self.{f.plain} = {f.swift}")
     out.append("    }")
+    for f in it.fields:
+        arc = arc_field(f.ty)
+        if not arc:
+            continue
+        wrapper, _, optional = arc
+        out.append("")
+        out += doc_lines(f.docs, "    ")
+        out.append(f"    public var {f.swift}: {swift_type(f.ty)} {{")
+        out.append(f"        @inlinable get {{ {f.plain}Box{'?' if optional else ''}.value }}")
+        value = f"newValue.map {{ {wrapper}($0) }}" if optional else f"{wrapper}(newValue)"
+        out.append(f"        set {{ {f.plain}Box = {value} }}")
+        out.append("    }")
     if derived_default:
         out.append("")
         out.append(f"    public static var `default`: {it.name} {{ {it.name}() }}")
@@ -602,6 +680,7 @@ def emit_struct(it, out):
 
 def emit_tuple(it, out):
     """A tuple struct: serde writes a newtype as its inner value and more fields as a sequence."""
+    refuse_arc(it.name, [f.ty for f in it.fields])
     derived_default = "Default" in it.derives and not it.manual_default
     out += doc_lines(it.docs)
     out.append(f"public struct {type_decl(it)}: {', '.join(conformances(it))} {{")
@@ -698,6 +777,8 @@ def emit_enum(it, out):
             out.append("    }")
         out.append("}")
         return
+    for v in it.variants:
+        refuse_arc(f"{it.name}::{v.name}", v.types if v.shape == "tuple" else [f.ty for f in getattr(v, "fields", [])])
     indirect = "indirect " if any(v.shape != "unit" for v in it.variants) and it.name not in DIRECT_ENUMS else ""
     out.append(f"public {indirect}enum {it.name}: {', '.join(conformances(it))} {{")
     for v in it.variants:
@@ -833,6 +914,10 @@ def main(argv):
     DIRECT_ENUMS.update(a for i, a in enumerate(argv) if i > 0 and argv[i - 1] == "--direct")
     if "--box" in argv:
         BOX_TYPE = argv[argv.index("--box") + 1]
+    for i, a in enumerate(argv):
+        if a == "--arc":
+            wrapper, names = argv[i + 1].split("=", 1)
+            ARC_TYPES.update((n.strip(), wrapper) for n in names.split(",") if n.strip())
     imports = [a for i, a in enumerate(argv) if i > 0 and argv[i - 1] == "--import"]
     lines += [f"import {m}" for m in imports]
     parsed = [(path, parse_items(path)) for path in files]
