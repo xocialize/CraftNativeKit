@@ -20,6 +20,9 @@ Every `#[derive(... Serialize ...)]` struct and enum in the given files becomes 
 `--rename Float=FloatingObject` renames a Rust type that would shadow a Swift one. A non-generic
 `pub type X = T;` becomes a `typealias`.
 
+`--direct Value` emits that enum without `indirect`: every payload is otherwise boxed, which costs an
+allocation per value on a hot path. Use it when the recursion already goes through `Box`, `Vec` or an array.
+
 `--box Indirect` maps `Box<T>` to `Indirect<T>` (a hand-written wrapper that lets value types recurse);
 without it `Box<T>` is `T`.
 
@@ -39,7 +42,7 @@ import sys
 PRIMS = {
     "f64": "Double", "f32": "Float", "u8": "UInt8", "u16": "UInt16", "u32": "UInt32", "u64": "UInt64",
     "i8": "Int8", "i16": "Int16", "i32": "Int32", "i64": "Int64", "usize": "Int", "isize": "Int",
-    "bool": "Bool", "String": "String", "char": "Unicode.Scalar",
+    "bool": "Bool", "String": "String", "str": "String", "char": "Unicode.Scalar",
 }
 
 # `default = "fn"` → Swift expression.
@@ -229,6 +232,8 @@ def parse_type(t):
 
 
 BOX_TYPE = None
+# `--direct Name`: enums emitted without `indirect` (their recursion goes through a boxed or array type).
+DIRECT_ENUMS = set()
 # `pub type X = T;` across all the files, so defaults see through them.
 ALIASES = {}
 
@@ -682,7 +687,7 @@ def emit_enum(it, out):
             out.append("    }")
         out.append("}")
         return
-    indirect = "indirect " if any(v.shape != "unit" for v in it.variants) else ""
+    indirect = "indirect " if any(v.shape != "unit" for v in it.variants) and it.name not in DIRECT_ENUMS else ""
     out.append(f"public {indirect}enum {it.name}: {', '.join(conformances(it))} {{")
     for v in it.variants:
         out += doc_lines(v.docs, "    ")
@@ -814,6 +819,7 @@ def main(argv):
         if a == "--rename":
             old, new = argv[i + 1].split("=", 1)
             RENAMED_TYPES[old] = new
+    DIRECT_ENUMS.update(a for i, a in enumerate(argv) if i > 0 and argv[i - 1] == "--direct")
     if "--box" in argv:
         BOX_TYPE = argv[argv.index("--box") + 1]
     imports = [a for i, a in enumerate(argv) if i > 0 and argv[i - 1] == "--import"]
