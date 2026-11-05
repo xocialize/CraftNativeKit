@@ -16,7 +16,7 @@ import Darwin
 /// An RGBA8 colour, straight alpha.
 public typealias MetafileColor = SIMD4<UInt8>
 
-/// The entry points: `Metafile.parse` and `Metafile.isMetafile`.
+/// The entry points: `Metafile.parse`, `Metafile.size` and `Metafile.isMetafile`.
 public enum Metafile {
     /// Items kept from one file. Past the cap the parse stops and keeps what it has.
     static let maxItems = 200_000
@@ -155,7 +155,7 @@ public enum Metafile {
     }
 
     /// `v as f32` when that is finite.
-    private static func f(_ v: Double) -> Float? {
+    static func f(_ v: Double) -> Float? {
         let v = Float(v)
         return v.isFinite ? v : nil
     }

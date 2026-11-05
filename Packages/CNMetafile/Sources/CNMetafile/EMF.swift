@@ -67,7 +67,7 @@ enum EMF {
     }
 
     /// The frame from `rclFrame` (offset 24), `szlDevice` (72) and `szlMillimeters` (80) in the header.
-    private static func frameFromHeader(_ input: Bytes) -> Frame? {
+    static func frameFromHeader(_ input: Bytes) -> Frame? {
         guard let f = rect32(input, 24) else { return nil }
         let (fl, ft, fr, fb) = (f[0], f[1], f[2], f[3])
         if fr <= fl || fb <= ft { return nil }

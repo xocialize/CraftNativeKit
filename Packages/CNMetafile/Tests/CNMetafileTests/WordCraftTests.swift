@@ -1,10 +1,15 @@
 // The tests that exist only in WordCraft's metafile crate (the five commits deckcraft never took), one Swift test per
 // Rust test with the same name in camel case, plus the WordCraft text run and crop rule as CNMetafile carries them.
-// Port of WordCraft crates/metafile/src/{canvas,dib,tests}.rs at fd7f6621 (MIT OR Apache-2.0, © ArtCraft Team and
-// the WordCraft contributors).
+// Port of WordCraft crates/metafile/src/{canvas,dib,tests}.rs at fd7f6621, and of the tests 991a21de, c38cd8c4 and
+// c9ecb1a1 add to dib.rs and tests.rs at 5a4c45e7 (MIT OR Apache-2.0, © ArtCraft Team and the WordCraft contributors).
 import CNCore
 @testable import CNMetafile
+import Foundation
 import Testing
+
+/// The timing tests (Rust's `#[ignore = "timing only"]`) run only with `CNMETAFILE_TIMING` set, ideally in a
+/// release build: `CNMETAFILE_TIMING=1 swift test -c release --filter Speed`.
+private let timing = ProcessInfo.processInfo.environment["CNMETAFILE_TIMING"] != nil
 
 /// WordCraft's test generator: xorshift64 from `seed`.
 private struct XorShift {
@@ -165,6 +170,308 @@ private func makeDib(_ w: Int, _ h: Int32, _ bpp: Int, _ rnd: inout XorShift) ->
     decoded = 0
     _ = try #require(DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: false, [0, 0, 0, 0], R4(0, 0, 400, 300), decoded: &decoded))
     #expect(decoded == 400 * 300)
+}
+
+// MARK: dib.rs — the row decoder chosen once per bitmap (c38cd8c4) and the side cap (991a21de)
+
+/// The per-pixel decoder `decodeClip` used before the depth was chosen once per bitmap. Kept as the reference the
+/// fast decoder must match byte for byte.
+private func referencePixel(_ data: [UInt8], _ row: Int, _ x: Int, _ hd: Header, _ pal: [UInt8], _ keepAlpha: Bool) -> (UInt8, UInt8, UInt8, UInt8)? {
+    func at(_ i: Int) -> UInt8? { data.indices.contains(i) ? data[i] : nil }
+    let (mR, mG, mB) = hd.masks
+    let rgb: (UInt8, UInt8, UInt8)
+    switch hd.bpp {
+    case 1:
+        guard let b = at(row + x / 8) else { return nil }
+        rgb = DIB.palette(pal, Int((b >> (7 - UInt8(x % 8))) & 1))
+    case 4:
+        guard let b = at(row + x / 2) else { return nil }
+        rgb = DIB.palette(pal, Int(x % 2 == 0 ? b >> 4 : b & 0x0F))
+    case 8:
+        guard let b = at(row + x) else { return nil }
+        rgb = DIB.palette(pal, Int(b))
+    case 24:
+        guard let b = at(row + x * 3), let g = at(row + x * 3 + 1), let r = at(row + x * 3 + 2) else { return nil }
+        rgb = (r, g, b)
+    case 16:
+        guard let lo = at(row + x * 2), let hi = at(row + x * 2 + 1) else { return nil }
+        let v = UInt32(lo) | UInt32(hi) << 8
+        rgb = (referenceField(v, mR), referenceField(v, mG), referenceField(v, mB))
+    default:
+        let o = row + x * 4
+        guard let b0 = at(o), let b1 = at(o + 1), let b2 = at(o + 2), let b3 = at(o + 3) else { return nil }
+        let v = UInt32(b0) | UInt32(b1) << 8 | UInt32(b2) << 16 | UInt32(b3) << 24
+        let a: UInt8 = keepAlpha ? UInt8(truncatingIfNeeded: v >> 24) : 255
+        return (referenceField(v, mR), referenceField(v, mG), referenceField(v, mB), a)
+    }
+    return (rgb.0, rgb.1, rgb.2, 255)
+}
+
+/// Extracts one channel from a masked pixel value and scales it to 8 bits.
+private func referenceField(_ v: UInt32, _ mask: UInt32) -> UInt8 {
+    if mask == 0 { return 0 }
+    let shift = UInt32(mask.trailingZeroBitCount)
+    let max = UInt64(mask >> shift)
+    let val = UInt64((v & mask) >> shift)
+    return UInt8(truncatingIfNeeded: (val * 255 + max / 2) / max)
+}
+
+/// `decodeClip` as it was: the same checks and clip, then `referencePixel` for every output pixel.
+private func decodeClipReference(_ info: [UInt8], _ bits: [UInt8], _ keepAlpha: Bool, _ src: [Int64], _ dst: R4) -> (Rgba, R4)? {
+    guard let hd = Header.read(Bytes(info)) else { return nil }
+    let pixels = hd.w * hd.h
+    guard pixels > 0, pixels <= Metafile.maxPixels else { return nil }
+    let stride = (hd.w * hd.bpp + 31) / 32 * 4
+    guard let data = Bytes(bits).slice(0, stride * hd.h)?.array, let pal = Bytes(info).slice(hd.palOff, hd.palN * 4)?.array,
+          let (c, out) = DIB.clipRect(w: hd.w, h: hd.h, bottomUp: !hd.topDown, src, dst) else { return nil }
+    let (ow, oh) = (c.x1 - c.x0, c.r1 - c.r0)
+    var px: [UInt8] = []
+    px.reserveCapacity(ow * oh * 4)
+    for y in c.r0 ..< c.r1 {
+        let row = (hd.topDown ? y : hd.h - 1 - y) * stride
+        for x in c.x0 ..< c.x1 {
+            guard let p = referencePixel(data, row, x, hd, pal, keepAlpha) else { return nil }
+            px += [p.0, p.1, p.2, p.3]
+        }
+    }
+    return (Rgba(w: ow, h: oh, bottomUp: false, px: px), out)
+}
+
+/// A DIB with chosen header fields: `masks` makes it BI_BITFIELDS (inline after a 40 byte header, or inside a larger
+/// header), `clrUsed` limits the palette, and the palette, when the depth is indexed, has `palEntries` entries (fewer
+/// than the depth names reads as black).
+private func makeDibWith(
+    _ w: Int, _ h: Int32, _ bpp: Int, _ masks: ((UInt32, UInt32, UInt32), Int)?, _ clrUsed: UInt32, _ palEntries: Int,
+    _ rnd: inout XorShift
+) -> ([UInt8], [UInt8]) {
+    let size = masks?.1 ?? 40
+    var info = h32(UInt32(size)) + e32(w) + h32(UInt32(bitPattern: h)) + u16b(1) + u16b(UInt16(bpp))
+    info += h32(masks != nil ? 3 : 0) + [UInt8](repeating: 0, count: 12) + h32(clrUsed) + [UInt8](repeating: 0, count: 4)
+    if info.count < size { info += [UInt8](repeating: 0, count: size - info.count) }
+    if let ((r, g, b), _) = masks {
+        let bytes = h32(r) + h32(g) + h32(b)
+        if size == 40 {
+            info += bytes
+        } else if info.count >= 52 {
+            put(&info, 40, bytes)
+        }
+    }
+    for _ in 0 ..< palEntries * 4 { info.append(UInt8(truncatingIfNeeded: rnd.next())) }
+    let stride = (w * bpp + 31) / 32 * 4
+    let bits = (0 ..< stride * Int(h.magnitude)).map { _ in UInt8(truncatingIfNeeded: rnd.next()) }
+    return (info, bits)
+}
+
+/// `decodeClip` and the reference agree on every crop, with and without alpha; returns the number of cases.
+private func assertSame(_ info: [UInt8], _ bits: [UInt8], _ what: String) -> Int {
+    var cases = 0
+    for keepAlpha in [false, true] {
+        for src: [Int64] in [[0, 0, 0, 0], [3, 1, 20, 3], [-4, -4, 100, 100], [36, 4, 5, 5], [1, 0, 1, 5], [8, 2, 17, 2], [0, 3, 37, 1]] {
+            let dst = R4(1, 2, 30, 40)
+            let old = decodeClipReference(info, bits, keepAlpha, src, dst)
+            let new = DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: keepAlpha, src, dst)
+            switch (old, new) {
+            case (nil, nil):
+                break
+            case let ((a, ad)?, (b, bd)?):
+                #expect(a.w == b.w && a.h == b.h && a.px == b.px, "\(what) alpha=\(keepAlpha) \(src)")
+                #expect((0 ..< 4).allSatisfy { ad[$0].bitPattern == bd[$0].bitPattern }, "\(what) alpha=\(keepAlpha) \(src)")
+            default:
+                Issue.record("old and new disagree on nil: \(what) alpha=\(keepAlpha) \(src)")
+            }
+            cases += 1
+        }
+    }
+    return cases
+}
+
+@Test func decodeClipMatchesThePerPixelReferenceAtEveryDepthPaletteAndMask() {
+    var rnd = XorShift(seed: 0x9E37_79B9_7F4A_7C15)
+    var cases = 0
+    // Widths that leave padding bits in the row, so a row's last byte is only partly used.
+    for w in [1, 9, 37] {
+        for h: Int32 in [6, -6] {
+            for bpp in [1, 4, 8] {
+                let n = 1 << bpp
+                // Full palette, clrUsed shorter than the depth (the rest reads black), a palette cut short of what
+                // clrUsed names, and none at all.
+                for (clrUsed, entries) in [(UInt32(0), n), (3, 3), (UInt32(n + 50), n), (0, 1), (0, 0)] {
+                    let (info, bits) = makeDibWith(w, h, bpp, nil, clrUsed, entries, &rnd)
+                    cases += assertSame(info, bits, "\(bpp) bpp w=\(w) h=\(h) clrUsed=\(clrUsed) palette=\(entries)")
+                }
+            }
+            var (info, bits) = makeDibWith(w, h, 24, nil, 0, 0, &rnd)
+            cases += assertSame(info, bits, "24 bpp w=\(w) h=\(h)")
+            // A colour table on a deep DIB is carried but unused.
+            (info, bits) = makeDibWith(w, h, 24, nil, 5, 5, &rnd)
+            cases += assertSame(info, bits, "24 bpp with palette w=\(w) h=\(h)")
+            // Masks on depths that ignore them still move the palette and the bits.
+            for bpp in [1, 8, 24] {
+                let n = bpp == 24 ? 0 : 1 << bpp
+                (info, bits) = makeDibWith(w, h, bpp, ((0xF800, 0x07E0, 0x001F), 40), 0, n, &rnd)
+                cases += assertSame(info, bits, "\(bpp) bpp with masks w=\(w) h=\(h)")
+            }
+            let masks16: [(UInt32, UInt32, UInt32)?] = [
+                nil, (0xF800, 0x07E0, 0x001F), (0x7C00, 0x03E0, 0x001F), (0x0F00, 0x00F0, 0x000F), (0xF800, 0x0000, 0x001F),
+            ]
+            let masks32: [(UInt32, UInt32, UInt32)?] = [
+                nil, (0xFF_0000, 0xFF00, 0xFF), (0xFF, 0xFF00, 0xFF_0000), (0x3FF0_0000, 0x000F_FC00, 0x0000_03FF),
+                (0xFFFF_FFFF, 0x0000_FF00, 0), (0x00FF_FF00, 0x00FF_FF00, 0x0000_00FF),
+            ]
+            for (bpp, sets) in [(16, masks16), (32, masks32)] {
+                for m in sets {
+                    // 40: the masks follow the header; 56 and 108: they are inside it.
+                    for hsize in [40, 56, 108] {
+                        (info, bits) = makeDibWith(w, h, bpp, m.map { ($0, hsize) }, 0, 0, &rnd)
+                        cases += assertSame(info, bits, "\(bpp) bpp masks=\(String(describing: m)) header=\(hsize) w=\(w) h=\(h)")
+                    }
+                }
+            }
+        }
+    }
+    #expect(cases == 3 * 2 * (15 + 2 + 3 + 33) * 14)
+}
+
+/// Timing of the per-pixel reference against `decodeClip` on a 40 MP bitmap (see `timing`).
+@Test(.enabled(if: timing, "timing only")) func dibDecodeSpeed() {
+    var rnd = XorShift(seed: 6)
+    for bpp in [1, 4, 8, 16, 24, 32] {
+        let (info, bits) = makeDib(8000, -5000, bpp, &rnd)
+        for round in 0 ..< 4 {
+            var t = ContinuousClock.now
+            let a = decodeClipReference(info, bits, false, [0, 0, 8000, 5000], R4(0, 0, 1, 1))?.0.px
+            let slow = ContinuousClock.now - t
+            t = ContinuousClock.now
+            let b = DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: false, [0, 0, 8000, 5000], R4(0, 0, 1, 1))?.0.px
+            let fast = ContinuousClock.now - t
+            #expect(a == b)
+            print("\(bpp) bpp round \(round): reference \(slow), decodeClip \(fast)")
+        }
+    }
+}
+
+@Test func decodeClipRefusesASideNoRendererDraws() throws {
+    let cap = Int(Metafile.maxBitmapSide)
+    var rnd = XorShift(seed: 11)
+    // 1 bpp, one row longer than the cap: 5 KB of bits, 120 KB of RGBA.
+    var (info, bits) = makeDib(cap + 1, 1, 1, &rnd)
+    #expect(DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: false, [0, 0, 0, 0], R4(0, 0, 1, 1)) == nil)
+    // The same for the height.
+    (info, bits) = makeDib(1, Int32(cap) + 1, 1, &rnd)
+    #expect(DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: false, [0, 0, 0, 0], R4(0, 0, 1, 1)) == nil)
+    // A crop of the wide bitmap within the cap still decodes, and so does the cap itself.
+    (info, bits) = makeDib(cap + 1, 1, 1, &rnd)
+    var (img, _) = try #require(DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: false, [10, 0, 100, 1], R4(0, 0, 1, 1)))
+    #expect(img.w == 100 && img.h == 1)
+    (info, bits) = makeDib(cap, 1, 1, &rnd)
+    (img, _) = try #require(DIB.decodeClip(Bytes(info), Bytes(bits), keepAlpha: false, [0, 0, 0, 0], R4(0, 0, 1, 1)))
+    #expect(img.w == cap && img.h == 1)
+}
+
+// MARK: tests.rs — the picture size from the header (c9ecb1a1)
+
+private func sizeOf(_ file: [UInt8]) -> Result<SIMD2<Float>, MetafileError> {
+    Result { () throws(MetafileError) in
+        let s = try Metafile.size(file)
+        return SIMD2(s.width, s.height)
+    }
+}
+
+private func parsedSize(_ file: [UInt8]) -> Result<SIMD2<Float>, MetafileError> {
+    Result { () throws(MetafileError) in
+        let p = try Metafile.parse(file)
+        return SIMD2(p.width, p.height)
+    }
+}
+
+/// `size` against the full parse: same numbers or same error, and whether the header decided it.
+private func assertSizeMatchesParse(_ file: [UInt8], _ fromHeader: Bool, _ what: String) {
+    let full = parsedSize(file)
+    #expect(sizeOf(file) == full, "\(what)")
+    let header = Metafile.headerSize(Bytes(file))
+    #expect((header != nil) == fromHeader, "\(what): header path")
+    if let s = header {
+        #expect(.success(SIMD2(s.width, s.height)) == full, "\(what): header size")
+    }
+}
+
+@Test func sizeFromTheHeaderEqualsTheFullParse() {
+    let rect = { erec(43, cat([e32(0), e32(0), e32(50), e32(25)])) }
+    let emfs: [(String, [UInt8], Bool)] = [
+        ("emf with a frame", emf([rect()], [0, 0, 50, 25], [0, 0, 2500, 1250]), true),
+        ("emf with a large frame", emf([rect()], [0, 0, 50, 25], [-90_000, 0, 900_000, 1_250_000]), true),
+        ("emf with an empty frame", emf([rect()], [0, 0, 50, 25], [0, 0, 0, 0]), false),
+        ("emf with no records", emf([], [0, 0, 50, 25], [0, 0, 2500, 1250]), false),
+        ("emf with no frame and no bounds", emf([rect()], [0, 0, 0, 0], [0, 0, 0, 0]), false),
+    ]
+    for (what, file, header) in emfs {
+        assertSizeMatchesParse(file, header, what)
+    }
+    let draw = wrec(0x041B, cat([h16(1440), h16(2880), h16(0), h16(0)]))
+    let wmfs: [(String, [UInt8], Bool)] = [
+        ("placeable wmf", wmf([draw], [0, 0, 2880, 1440]), true),
+        (
+            "placeable wmf with a window mapping",
+            wmf([wrec(0x0103, h16(8)), wrec(0x020C, cat([h16(100), h16(200)])), wrec(0x020E, cat([h16(50), h16(100)])), draw], [0, 0, 200, 100]),
+            false
+        ),
+        ("placeable wmf with a zero viewport", wmf([wrec(0x0103, h16(8)), wrec(0x020E, cat([h16(0), h16(0)])), draw], [0, 0, 200, 100]), false),
+        ("placeable wmf with a window only", wmf([wrec(0x020C, cat([h16(100), h16(200)])), draw], [0, 0, 200, 100]), true),
+        ("placeable wmf with an empty box", wmf([draw], [0, 0, 0, 0]), false),
+        ("placeable wmf with no records", wmf([], [0, 0, 2880, 1440]), false),
+        ("plain wmf", wmf([draw], nil), false),
+    ]
+    for (what, file, header) in wmfs {
+        assertSizeMatchesParse(file, header, what)
+    }
+    assertSizeMatchesParse(Array("not a metafile at all".utf8), false, "garbage")
+    assertSizeMatchesParse([], false, "empty")
+}
+
+@Test func sizeOfATruncatedOrMutatedFileEqualsTheFullParse() {
+    let rect = erec(43, cat([e32(0), e32(0), e32(50), e32(25)]))
+    let draw = wrec(0x041B, cat([h16(1440), h16(2880), h16(0), h16(0)]))
+    let files = [emf([rect], [0, 0, 50, 25], [0, 0, 2500, 1250]), wmf([draw], [0, 0, 2880, 1440])]
+    var rnd = XorShift(seed: 0x1234_5678_9ABC_DEF0)
+    for file in files {
+        for len in 0 ... file.count {
+            let cut = Array(file[..<len])
+            #expect(sizeOf(cut) == parsedSize(cut), "cut at \(len)")
+        }
+        for _ in 0 ..< 3000 {
+            var m = file
+            for _ in 0 ..< 3 {
+                let seed = rnd.next()
+                m[Int(seed % UInt64(m.count))] = UInt8(truncatingIfNeeded: seed >> 32)
+            }
+            #expect(sizeOf(m) == parsedSize(m), "\(m)")
+        }
+    }
+}
+
+/// Time of the full parse against the header-only size for an EMF with one 8000 × 5000, 1 bpp bitmap (5 MB, decodes
+/// to 160 MB); see `timing`.
+@Test(.enabled(if: timing, "timing only")) func sizeSpeed() {
+    let (w, h) = (8000, 5000)
+    var payload = [UInt8](repeating: 0, count: 16)
+    payload += cat([
+        e32(0), e32(0), e32(0), e32(0), e32(w), e32(h), e32(80), e32(48), e32(128), h32(UInt32(w / 8 * h)), e32(0), e32(0x00CC_0020),
+        e32(100), e32(50),
+    ])
+    payload += infoHeader(w, h, 1, 0)
+    payload += [0, 0, 0, 0, 255, 255, 255, 0]
+    payload += (0 ..< w / 8 * h).map { UInt8(truncatingIfNeeded: $0 * 31) }
+    let file = emf([erec(81, payload)], [0, 0, 100, 50], [0, 0, 2500, 1250])
+    for round in 0 ..< 4 {
+        var t = ContinuousClock.now
+        let full = parsedSize(file)
+        let fullTime = ContinuousClock.now - t
+        t = ContinuousClock.now
+        let fast = sizeOf(file)
+        let fastTime = ContinuousClock.now - t
+        #expect(full == fast)
+        print("round \(round): parse \(fullTime), size \(fastTime)")
+    }
 }
 
 // MARK: tests.rs — crop window (0cca2f7d, fc5063c3)

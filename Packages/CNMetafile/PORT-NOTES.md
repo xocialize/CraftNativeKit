@@ -23,6 +23,7 @@ for the `cg…` conveniences; nothing imports AppKit.
 | `EMFPlus.swift` | `emfplus.rs` | |
 | `ImageDecode.swift` | `emfplus.rs` `decode_compressed` | ImageIO instead of the `image` crate (see below). |
 | `Metafile.swift` | `lib.rs` | Entry points, the public model, `build`. |
+| `Size.swift` | WordCraft `size.rs` | `Metafile.size`: the picture size from the header (see the re-sync to 5a4c45e7). |
 | `Place.swift` | `place.rs` | Placement, plus the kurbo pieces it uses (Affine, Rect, BezPath, cubic bounding boxes with `solve_quadratic`). WordCraft's `crop_window` and crop rule. |
 | `TextRun.swift` | WordCraft `lib.rs` `Text`, `place.rs` `Text::layout` | WordCraft's view of a text run, derived from `MetafileText` (see the WordCraft merge). |
 
@@ -36,6 +37,7 @@ the tests that exist only in WordCraft's crate (see the WordCraft merge).
 ```swift
 Metafile.isMetafile(_ bytes: [UInt8]) -> Bool
 Metafile.parse(_ bytes: [UInt8]) throws(MetafileError) -> MetafilePicture   // .notMetafile, .badHeader, .noRecords
+Metafile.size(_ bytes: [UInt8]) throws(MetafileError) -> (width: Float, height: Float)  // parse's width/height or error
 Metafile.symbolCharset: UInt8            // SYMBOL_CHARSET (2)
 Metafile.maxBitmapSide: UInt32           // MAX_BITMAP_SIDE (30_000)
 
@@ -198,3 +200,58 @@ Receipts: `swift test --filter CNMetafileTests` passes all of them. `Tools/oracl
 (deckcraft at the pin `a3fbf029`) regenerated into a scratch folder is byte-identical to the stored fixtures, and
 `metafileOracleParity` matches all 325 cases.
 
+## Re-sync to wordcraft 5a4c45e7 (2026-11-05, 0.5.3)
+
+The WordCraft merge above ported from `fd7f6621`; `crates/metafile` is unchanged from there to `2df2bfc3`, and three
+commits land between `2df2bfc3` and `5a4c45e7` (WordCraft checkout, MIT OR Apache-2.0, © ArtCraft Team and the
+WordCraft contributors). All three are ported; `DIB.swift` and `Size.swift` name `5a4c45e7` in their headers (`EMF.swift` and `Metafile.swift` change only visibility).
+
+| WordCraft commit | What | Here |
+|---|---|---|
+| `991a21de` (#5480) | Refuse a bitmap whose side no renderer draws before decoding it | `DIB.decodeClip` is nil when the clipped width or height is over `Metafile.maxBitmapSide` (30,000), after the whole-DIB checks and the clip, before any pixel is allocated. |
+| `c38cd8c4` (#5479) | Decode DIB bitmaps with the bit depth chosen once per bitmap | `RowKind` (indexed / BGR24 / BGRA32 with the default masks / masked 16 and 32 bpp) is chosen once from the header and decodes whole rows; `Channel` works out a mask's shift and scale once, with a 256-entry table for channels of up to 8 bits. The per-pixel `pixel`/`field` pair moved to the tests as the reference. Output unchanged. |
+| `c9ecb1a1` (#5481) | Read the picture size from the header instead of parsing the whole file | `Size.swift`: `Metafile.size(_:)` and the internal `Metafile.headerSize(_:)`. An EMF with a usable `rclFrame` and a first record that is not EOF, or a placeable WMF with a positive box, a first record and no SetMapMode/SetViewportExt record, gives its size from the header; anything else takes the full parse. `EMF.frameFromHeader` and `Metafile.f` are internal now (were private), as `frame_from_header` became `pub(crate)`. |
+
+File map: `DIB.swift` ← `dib.rs`; `Size.swift` ← `size.rs` (new); `EMF.swift` ← `emf.rs` (visibility only);
+`Metafile.swift` ← `lib.rs` (`pub use size::size` is the `Metafile.size` extension; `f` internal);
+`WordCraftTests.swift` ← the new tests of `dib.rs` and `tests.rs`.
+
+**Public API.** One addition: `Metafile.size(_ bytes: [UInt8]) throws(MetafileError) -> (width: Float, height: Float)`
+(WordCraft's `pub fn size(bytes: &[u8]) -> Result<(f32, f32), Error>`). The labelled tuple destructures as
+`let (w, h) = try Metafile.size(bytes)`. Marquee Documents' `metafile_size` is the caller.
+
+**Deviations.**
+
+- **The side cap reaches DeckCraftNative too.** CNMetafile has one DIB decoder for both apps, so deckcraft's reading
+  (which has no cap in `decode_clip`) now also drops a blit whose clipped side is over 30,000 instead of keeping an item
+  that `takePixels` refuses. Drawing is the same; only the model and the byte budget charged for the undrawable pixels
+  differ. The deckcraft oracle still matches all 325 cases. The cap is on `decodeClip` only (the EMF and WMF blits), as
+  upstream; `DIB.decode` (pattern brushes, deckcraft only) is unchanged.
+- **Indexed DIBs** already went through a 256-entry lookup here (see the file map), so for them `c38cd8c4` only moves
+  the loop into `RowKind`. Rows are checked once (the row lies inside the bits, and the last column's bytes inside the
+  row) and then indexed directly, instead of a checked read per byte.
+- **The decoded-pixel counter** (`decoded: inout`, WordCraft's thread-local `DECODED`) now counts the pixels asked of
+  the decoder before decoding, as upstream.
+- **Timing tests.** Rust's `#[ignore = "timing only"]` tests are `@Test(.enabled(if: timing))`, run with
+  `CNMETAFILE_TIMING=1 swift test -c release -Xswiftc -enable-testing --filter Speed`.
+
+**Tests.** Rust test → Swift test (all in `WordCraftTests.swift`):
+
+| Rust (`5a4c45e7`) | Swift |
+|---|---|
+| `dib.rs` `decode_clip_matches_the_per_pixel_reference_at_every_depth_palette_and_mask` | `decodeClipMatchesThePerPixelReferenceAtEveryDepthPaletteAndMask` (4,452 crops: 1/4/8 bpp with full, short, overlong and missing palettes; 24 bpp with and without a colour table; masks on depths that ignore them; five 16 bpp and six 32 bpp mask sets with 40/56/108-byte headers; widths 1, 9, 37, both row orders, with and without alpha) |
+| `dib.rs` `decode_clip_refuses_a_side_no_renderer_draws` | `decodeClipRefusesASideNoRendererDraws` |
+| `dib.rs` `dib_decode_speed` (ignored) | `dibDecodeSpeed` (timing only) |
+| `tests.rs` `size_from_the_header_equals_the_full_parse` | `sizeFromTheHeaderEqualsTheFullParse` |
+| `tests.rs` `size_of_a_truncated_or_mutated_file_equals_the_full_parse` | `sizeOfATruncatedOrMutatedFileEqualsTheFullParse` (every truncation and 3,000 three-byte mutations of an EMF and a placeable WMF) |
+| `tests.rs` `size_speed` (ignored) | `sizeSpeed` (timing only) |
+
+The size tests compare `Metafile.size` with this package's own `parse` (deckcraft's reader with the WordCraft
+merges), so they also check that the header path agrees with the EMF+ and WMF readers here.
+
+Receipts (Apple M5 Max, Swift 6.4.2, debug unless stated): `CNMetafileTests` 134 tests (128 before, 6 new), 132 run
+and pass, the 2 timing tests skip; `metafileOracleParity` matches all 325 cases with the fixtures present. The rest of
+the kit: CNCore 28, CNZip 24, CNCFB 12, CNOffCrypto 11, all pass. Release timings on 8000 × 5000 (40 MP, top-down, whole
+bitmap): per-pixel reference / `decodeClip` 100 / 69 ms at 1 bpp, 100 / 68 ms at 4, 95 / 66 ms at 8, 109 / 97 ms at 16,
+76 / 47 ms at 24, 126 / 48 ms at 32 (the Swift reference was already a lookup for indexed depths, unlike WordCraft's).
+`sizeSpeed`: the full parse takes 68 ms, `size` about 1 µs.

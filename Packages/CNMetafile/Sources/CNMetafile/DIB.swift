@@ -2,7 +2,8 @@
 // decode to RGBA8 rows, top-down. Compressed (RLE, JPEG, PNG) and V4/V5-only features are not decoded. Port of
 // deckcraft crates/metafile/src/dib.rs (MIT OR Apache-2.0, © ArtCraft Team and the DeckCraft contributors).
 // `decodeClip` and `clipRect` are from WordCraft crates/metafile/src/dib.rs at fd7f6621 (MIT OR Apache-2.0, ©
-// ArtCraft Team and the WordCraft contributors) (45d2546b).
+// ArtCraft Team and the WordCraft contributors) (45d2546b); the side cap in `decodeClip` (991a21de) and the row
+// decoders chosen once per bitmap (`RowKind`, `Channel`; c38cd8c4) are from the same file at 5a4c45e7.
 
 private let biRGB: UInt32 = 0
 private let biBitfields: UInt32 = 3
@@ -35,7 +36,8 @@ enum Blend {
     }
 }
 
-private struct Header {
+/// The fields of a BITMAPINFOHEADER every decode needs (internal for the tests' per-pixel reference decoder).
+struct Header {
     var w: Int
     var h: Int
     var topDown: Bool
@@ -99,7 +101,9 @@ enum DIB {
     /// with the part of the destination `dst` that it fills; see `clipRect` for the coordinates. `info` is the info
     /// part (header plus masks and palette) and `bits` the pixel bits; `keepAlpha` as for `decode`. Only the clipped
     /// rows and columns are decoded, so the work and the memory follow the crop, not the whole bitmap; the whole
-    /// bitmap is still validated (size cap, palette, bits length). Gives what `decode` then `clipBlit` gives.
+    /// bitmap is still validated (size cap, palette, bits length). Gives what `decode` then `clipBlit` gives, except
+    /// that it is nil as well when the clipped width or height is over `Metafile.maxBitmapSide`, which no renderer
+    /// draws.
     static func decodeClip(_ info: Bytes, _ bits: Bytes, keepAlpha: Bool, _ src: [Int64], _ dst: R4) -> (Rgba, R4)? {
         var decoded = 0
         return decodeClip(info, bits, keepAlpha: keepAlpha, src, dst, decoded: &decoded)
@@ -108,9 +112,14 @@ enum DIB {
     /// `decodeClip`, adding the number of pixels decoded to `decoded` (the tests check that it follows the crop).
     static func decodeClip(_ info: Bytes, _ bits: Bytes, keepAlpha: Bool, _ src: [Int64], _ dst: R4, decoded: inout Int) -> (Rgba, R4)? {
         guard let v = Validated(info, bits),
-              let (span, out) = clipRect(w: v.hd.w, h: v.hd.h, bottomUp: !v.hd.topDown, src, dst),
-              let px = decodeSpan(v, span, keepAlpha, &decoded)
+              let (span, out) = clipRect(w: v.hd.w, h: v.hd.h, bottomUp: !v.hd.topDown, src, dst)
         else { return nil }
+        // The renderers draw no bitmap with a side over the cap (`takePixels`); decoding one would only fill the
+        // parse's memory budget with pixels nobody draws.
+        let cap = Int(Metafile.maxBitmapSide)
+        guard span.x1 - span.x0 <= cap, span.r1 - span.r0 <= cap, let px = decodeSpan(v, span, keepAlpha, &decoded) else {
+            return nil
+        }
         return (Rgba(w: span.x1 - span.x0, h: span.r1 - span.r0, bottomUp: false, px: px), out)
     }
 
@@ -144,95 +153,33 @@ enum DIB {
         var r1: Int
     }
 
-    /// Decodes the pixels of `span` (top-down rows), counting them into `decoded`.
+    /// Decodes the pixels of `span` (top-down rows), adding the number asked of the decoder to `decoded`.
     private static func decodeSpan(_ v: Validated, _ span: Span, _ keepAlpha: Bool, _ decoded: inout Int) -> [UInt8]? {
         let hd = v.hd
         let (ow, oh) = (span.x1 - span.x0, span.r1 - span.r0)
         let (n, o1) = ow.multipliedReportingOverflow(by: oh)
         let (len, o2) = n.multipliedReportingOverflow(by: 4)
-        guard ow > 0, oh > 0, !o1, !o2 else { return nil }
-        // Rows index the shared buffer directly: every read stays inside its row, and the rows were checked to lie
-        // inside the bits.
+        guard ow > 0, oh > 0, !o1, !o2, span.x0 >= 0, span.r0 >= 0, span.r1 <= hd.h else { return nil }
+        decoded += n
+        // The depth, palette and masks are the same for every pixel: pick the row decoder once.
+        let kind = RowKind(hd, v.palette, keepAlpha)
         let (d, base) = (v.data.buffer, v.data.start)
         var px = [UInt8](repeating: 0, count: len)
         var o = 0
-        if hd.bpp <= 8 {
-            // Indexed: every possible index looked up once (missing entries are black).
-            var lut = [UInt8](repeating: 0, count: 256 * 4)
-            for i in 0 ..< 256 {
-                let c = Self.palette(v.palette, i)
-                (lut[i * 4], lut[i * 4 + 1], lut[i * 4 + 2], lut[i * 4 + 3]) = (c.0, c.1, c.2, 255)
-            }
-            let (bpp, mask) = (hd.bpp, UInt8(truncatingIfNeeded: (1 << hd.bpp) - 1))
-            for y in span.r0 ..< span.r1 {
-                let row = base + (hd.topDown ? y : hd.h - 1 - y) * v.stride
-                for x in span.x0 ..< span.x1 {
-                    let bit = x * bpp
-                    guard let b = byteAt(d, row + bit / 8) else { return nil }
-                    let k = Int((b >> UInt8(8 - bpp - bit % 8)) & mask) * 4
-                    (px[o], px[o + 1], px[o + 2], px[o + 3]) = (lut[k], lut[k + 1], lut[k + 2], 255)
-                    o += 4
-                }
-            }
-            decoded += n
-            return px
-        }
         for y in span.r0 ..< span.r1 {
+            // One source row, all of its bytes; `Validated` checked that the rows lie inside the bits.
             let row = base + (hd.topDown ? y : hd.h - 1 - y) * v.stride
-            for x in span.x0 ..< span.x1 {
-                guard let p = pixel(d, row, x, hd, v.palette, keepAlpha) else { return nil }
-                (px[o], px[o + 1], px[o + 2], px[o + 3]) = p
-                o += 4
-            }
+            guard row >= 0, row + v.stride <= d.count,
+                  kind.decodeRow(d, row: row, stride: v.stride, cols: span.x0 ..< span.x1, into: &px, at: o) else { return nil }
+            o += ow * 4
         }
-        decoded += n
         return px
     }
 
-    private static func pixel(_ data: [UInt8], _ row: Int, _ x: Int, _ hd: Header, _ pal: [UInt8], _ keepAlpha: Bool) -> (UInt8, UInt8, UInt8, UInt8)? {
-        let (mR, mG, mB) = hd.masks
-        let rgb: (UInt8, UInt8, UInt8)
-        switch hd.bpp {
-        case 1:
-            guard let b = byteAt(data, row + x / 8) else { return nil }
-            rgb = palette(pal, Int((b >> (7 - UInt8(x % 8))) & 1))
-        case 4:
-            guard let b = byteAt(data, row + x / 2) else { return nil }
-            rgb = palette(pal, Int(x % 2 == 0 ? b >> 4 : b & 0x0F))
-        case 8:
-            guard let b = byteAt(data, row + x) else { return nil }
-            rgb = palette(pal, Int(b))
-        case 24:
-            guard let b = byteAt(data, row + x * 3), let g = byteAt(data, row + x * 3 + 1), let r = byteAt(data, row + x * 3 + 2) else { return nil }
-            rgb = (r, g, b)
-        case 16:
-            let o = row + x * 2
-            guard let lo = byteAt(data, o), let hi = byteAt(data, o + 1) else { return nil }
-            let v = UInt32(lo) | UInt32(hi) << 8
-            rgb = (field(v, mR), field(v, mG), field(v, mB))
-        default:
-            let o = row + x * 4
-            guard let b0 = byteAt(data, o), let b1 = byteAt(data, o + 1), let b2 = byteAt(data, o + 2), let b3 = byteAt(data, o + 3) else { return nil }
-            let v = UInt32(b0) | UInt32(b1) << 8 | UInt32(b2) << 16 | UInt32(b3) << 24
-            let a: UInt8 = keepAlpha ? UInt8(truncatingIfNeeded: v >> 24) : 255
-            return (field(v, mR), field(v, mG), field(v, mB), a)
-        }
-        return (rgb.0, rgb.1, rgb.2, 255)
-    }
-
     /// Palette entries are BGRX quads; an index past the table reads as black rather than failing the image.
-    private static func palette(_ pal: [UInt8], _ i: Int) -> (UInt8, UInt8, UInt8) {
-        guard i * 4 + 4 <= pal.count else { return (0, 0, 0) }
+    static func palette(_ pal: [UInt8], _ i: Int) -> (UInt8, UInt8, UInt8) {
+        guard i >= 0, i * 4 + 4 <= pal.count else { return (0, 0, 0) }
         return (pal[i * 4 + 2], pal[i * 4 + 1], pal[i * 4])
-    }
-
-    /// Extracts one channel from a masked pixel value and scales it to 8 bits.
-    private static func field(_ v: UInt32, _ mask: UInt32) -> UInt8 {
-        if mask == 0 { return 0 }
-        let shift = UInt32(mask.trailingZeroBitCount)
-        let max = UInt64(mask >> shift)
-        let val = UInt64((v & mask) >> shift)
-        return UInt8(truncatingIfNeeded: (val * 255 + max / 2) / max)
     }
 
     /// Clips a source rectangle `src` = `[x, y, w, h]` to a `w` × `h` bitmap and returns the columns and top-down
@@ -338,6 +285,119 @@ enum DIB {
     }
 }
 
+/// One channel of a masked 16/32 bpp pixel, with the shift and scale worked out once per bitmap. Channels of up to
+/// 8 bits (every common 16 bpp layout) go through a table of their values, so a pixel costs no division.
+private struct Channel {
+    let mask: UInt32
+    let shift: UInt32
+    let max: UInt64
+    /// The 8-bit value of every channel value `0...max` when `max <= 255`.
+    let table: [UInt8]
+
+    init(_ mask: UInt32) {
+        let shift = mask == 0 ? 0 : UInt32(mask.trailingZeroBitCount)
+        let max = UInt64(mask >> shift)
+        var table = [UInt8](repeating: 0, count: 256)
+        if mask != 0 && max <= 255 {
+            for val in 0 ... Int(max) {
+                table[val] = UInt8(truncatingIfNeeded: (UInt64(val) * 255 + max / 2) / max)
+            }
+        }
+        (self.mask, self.shift, self.max, self.table) = (mask, shift, max, table)
+    }
+
+    /// The channel of `v` scaled to 8 bits; 0 when the mask is empty.
+    @inline(__always)
+    func get(_ v: UInt32) -> UInt8 {
+        if mask == 0 { return 0 }
+        let val = UInt64((v & mask) >> shift)
+        // `val <= max`, so a table index is at most 255.
+        if max <= 255 { return table[Int(val)] }
+        return UInt8(truncatingIfNeeded: (val * 255 + max / 2) / max)
+    }
+}
+
+/// How the pixels of one DIB turn into RGBA, decided once from its header.
+private enum RowKind {
+    /// 1, 4 or 8 bpp: `bpp` bits per index into a table of every possible index (RGBA quads).
+    case indexed(bpp: Int, table: [UInt8])
+    /// 24 bpp: BGR triples.
+    case bgr24
+    /// 32 bpp with the default masks: BGRA quads, alpha kept or forced opaque.
+    case bgra32(keepAlpha: Bool)
+    /// 16 bpp, or 32 bpp with other masks.
+    case masked(bpp: Int, r: Channel, g: Channel, b: Channel, keepAlpha: Bool)
+
+    init(_ hd: Header, _ pal: [UInt8], _ keepAlpha: Bool) {
+        switch hd.bpp {
+        case 1, 4, 8:
+            // An index past the palette reads as black, as in `palette`.
+            var table = [UInt8](repeating: 0, count: 256 * 4)
+            for i in 0 ..< 256 {
+                let c = i < 1 << hd.bpp ? DIB.palette(pal, i) : (0, 0, 0)
+                (table[i * 4], table[i * 4 + 1], table[i * 4 + 2], table[i * 4 + 3]) = (c.0, c.1, c.2, 255)
+            }
+            self = .indexed(bpp: hd.bpp, table: table)
+        case 24:
+            self = .bgr24
+        case 32 where hd.masks == (0xFF_0000, 0xFF00, 0xFF):
+            self = .bgra32(keepAlpha: keepAlpha)
+        default:
+            self = .masked(bpp: hd.bpp, r: Channel(hd.masks.0), g: Channel(hd.masks.1), b: Channel(hd.masks.2), keepAlpha: keepAlpha)
+        }
+    }
+
+    /// Decodes the columns `cols` of the source row of `stride` bytes at `row` in `d` into `px` from `at`. The caller
+    /// checked that the row lies inside `d` and `px` has room for the columns; false when the row is shorter than
+    /// the columns need.
+    func decodeRow(_ d: [UInt8], row: Int, stride: Int, cols: Range<Int>, into px: inout [UInt8], at start: Int) -> Bool {
+        var o = start
+        switch self {
+        case .indexed(let bpp, let table):
+            // The last column's byte must lie inside the row.
+            guard cols.upperBound * bpp <= stride * 8 else { return false }
+            let mask = (1 << bpp) - 1
+            for x in cols {
+                let bit = x * bpp
+                let k = (Int(d[row + bit / 8]) >> (8 - bpp - bit % 8) & mask) * 4
+                (px[o], px[o + 1], px[o + 2], px[o + 3]) = (table[k], table[k + 1], table[k + 2], 255)
+                o += 4
+            }
+        case .bgr24:
+            guard cols.upperBound * 3 <= stride else { return false }
+            for x in cols {
+                let s = row + x * 3
+                (px[o], px[o + 1], px[o + 2], px[o + 3]) = (d[s + 2], d[s + 1], d[s], 255)
+                o += 4
+            }
+        case .bgra32(let keepAlpha):
+            guard cols.upperBound * 4 <= stride else { return false }
+            for x in cols {
+                let s = row + x * 4
+                (px[o], px[o + 1], px[o + 2], px[o + 3]) = (d[s + 2], d[s + 1], d[s], keepAlpha ? d[s + 3] : 255)
+                o += 4
+            }
+        case .masked(bpp: 16, let r, let g, let b, _):
+            guard cols.upperBound * 2 <= stride else { return false }
+            for x in cols {
+                let s = row + x * 2
+                let v = UInt32(d[s]) | UInt32(d[s + 1]) << 8
+                (px[o], px[o + 1], px[o + 2], px[o + 3]) = (r.get(v), g.get(v), b.get(v), 255)
+                o += 4
+            }
+        case .masked(_, let r, let g, let b, let keepAlpha):
+            guard cols.upperBound * 4 <= stride else { return false }
+            for x in cols {
+                let s = row + x * 4
+                let v = UInt32(d[s]) | UInt32(d[s + 1]) << 8 | UInt32(d[s + 2]) << 16 | UInt32(d[s + 3]) << 24
+                (px[o], px[o + 1], px[o + 2], px[o + 3]) = (r.get(v), g.get(v), b.get(v), keepAlpha ? UInt8(truncatingIfNeeded: v >> 24) : 255)
+                o += 4
+            }
+        }
+        return true
+    }
+}
+
 extension Int64 {
     /// Rust's `saturating_add`.
     func addingSaturating(_ o: Int64) -> Int64 {
@@ -350,10 +410,4 @@ extension Int64 {
         let (v, overflow) = subtractingReportingOverflow(o)
         return overflow ? (o < 0 ? .max : .min) : v
     }
-}
-
-/// `data[i]`, or nil past either end (a non-generic `at`, which stays fast in debug builds).
-@inline(__always)
-private func byteAt(_ data: [UInt8], _ i: Int) -> UInt8? {
-    i >= 0 && i < data.count ? data[i] : nil
 }
