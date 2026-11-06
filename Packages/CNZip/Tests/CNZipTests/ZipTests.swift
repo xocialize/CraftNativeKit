@@ -10,6 +10,29 @@ import Testing
 @Suite struct ZipTests {
     /// `.rustZip` headers are the Rust `zip` crate 3's as gridcraft's XLSX writer sets them (measured on its output:
     /// made by 0x314, version 20, no flags, DEFLATE, 1980-01-01, external attributes 0x81A40000, no extra fields).
+    /// `lazyLocalHeaders` opens an archive whose local header is damaged, as the Rust `zip` crate does, and fails only
+    /// that entry when it is read.
+    @Test func lazyLocalHeadersFailOnlyTheDamagedEntry() throws {
+        var w = ZipWriter(headers: .rustZip)
+        try w.addDeflated("a.xml", Array("<a/>".utf8))
+        try w.addDeflated("b.xml", Array("<b/>".utf8))
+        var z = try w.finish()
+        // a.xml's local header: its extra-field length's high byte, so its data starts past the end.
+        z[29] = 0xC7
+        #expect(throws: (any Error).self) { _ = try ZipReader(z) }
+        let r = try ZipReader(z, lazyLocalHeaders: true)
+        #expect(r.entries.map(\.name) == ["a.xml", "b.xml"])
+        let a = try #require(r.find("a.xml"))
+        #expect(try r.dataStart(a) == 30 + 5 + 0xC700)
+        #expect(throws: (any Error).self) { _ = try r.read(a, max: 100) }
+        #expect(try r.read(named: "b.xml", max: 100) == Array("<b/>".utf8))
+        // A local header without its signature fails when read, too.
+        var y = try ZipWriter(headers: .rustZip).withEntry("c.xml", Array("<c/>".utf8))
+        y[0] = 0
+        let q = try ZipReader(y, lazyLocalHeaders: true)
+        #expect(throws: (any Error).self) { _ = try q.read(named: "c.xml", max: 100) }
+    }
+
     @Test func rustZipHeaders() throws {
         var w = ZipWriter(headers: .rustZip)
         try w.addDeflated("[Content_Types].xml", Array("<Types/>".utf8))
@@ -519,5 +542,13 @@ import Testing
             default: Issue.record("variant \(k): memory \(fromMemory), file \(fromFile)")
             }
         }
+    }
+}
+
+extension ZipWriter {
+    /// This writer with one DEFLATE entry, finished.
+    fileprivate consuming func withEntry(_ name: String, _ data: [UInt8]) throws -> [UInt8] {
+        try addDeflated(name, data)
+        return try finish()
     }
 }

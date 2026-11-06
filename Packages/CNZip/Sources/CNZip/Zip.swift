@@ -429,7 +429,10 @@ public struct ZipEntry: Hashable, Sendable {
     public var crc: UInt32
     public var compressedSize: Int
     public var uncompressedSize: Int
+    /// Where the payload starts; -1 until the local header is read, in a reader made with `lazyLocalHeaders`.
     public var dataOffset: Int
+    /// Where the entry's local header starts.
+    public var localHeaderOffset: Int = -1
 }
 
 /// An archive's bytes, read by range: in memory or in a file.
@@ -452,7 +455,9 @@ struct ZipArrayBytes: ZipBytes {
 /// The parsing both readers share.
 enum ZipDirectory {
     /// The entries of the archive in `src` (central-directory order) and whether it is ZIP64.
-    static func read(_ src: some ZipBytes) throws -> (entries: [ZipEntry], isZip64: Bool) {
+    /// `lazy` reads only the central directory, as the Rust `zip` crate does: an entry's local header is read (and a
+    /// bad one fails) when the entry is.
+    static func read(_ src: some ZipBytes, lazy: Bool = false) throws -> (entries: [ZipEntry], isZip64: Bool) {
         let size = src.count
         guard size >= 22 else { throw ZipError.corrupt("not a zip archive (too short)") }
         // End of central directory: scan back over a possible comment. The tail read also holds
@@ -528,6 +533,12 @@ enum ZipDirectory {
                 if compressed == max32 { compressed = try next() }
                 if local == max32 { local = try next() }
             }
+            if lazy {
+                entries.append(ZipEntry(name: name, method: UInt16(method), crc: UInt32(crc), compressedSize: compressed,
+                                        uncompressedSize: uncompressed, dataOffset: -1, localHeaderOffset: local))
+                p = entryEnd
+                continue
+            }
             // The local header gives the real data offset.
             guard local <= size else { throw ZipError.corrupt("truncated zip") }
             let header = try src.bytes(local ..< min(local + 30, size))
@@ -538,7 +549,7 @@ enum ZipDirectory {
             let (end, o2) = dataOffset.addingReportingOverflow(compressed)
             guard !o2, end <= size else { throw ZipError.corrupt("zip entry `\(name)` out of range") }
             entries.append(ZipEntry(name: name, method: UInt16(method), crc: UInt32(crc), compressedSize: compressed,
-                                    uncompressedSize: uncompressed, dataOffset: dataOffset))
+                                    uncompressedSize: uncompressed, dataOffset: dataOffset, localHeaderOffset: local))
             p = entryEnd
         }
         return (entries, zip64)
@@ -562,7 +573,20 @@ enum ZipDirectory {
 
     /// Entry `e`'s payload (decompressed), at most `max` bytes, CRC-checked; `raw` reads its stored
     /// bytes, whose range has been checked against `size`.
-    static func payload(_ e: ZipEntry, max: Int, size: Int, _ raw: (Range<Int>) throws -> [UInt8]) throws -> [UInt8] {
+    /// Where `e`'s payload starts: its `dataOffset`, or for a lazily read entry, from its local header (whose signature
+    /// is checked; the payload's end isn't).
+    static func dataStart(_ e: ZipEntry, size: Int, _ raw: (Range<Int>) throws -> [UInt8]) throws -> Int {
+        if e.dataOffset >= 0 { return e.dataOffset }
+        let local = e.localHeaderOffset
+        guard local >= 0, local <= size - 30 else { throw ZipError.corrupt("truncated zip") }
+        let header = try raw(local ..< local + 30)
+        guard try ZipReader.u32(header, 0) == Int(localSignature) else { throw ZipError.corrupt("bad zip local header") }
+        return local + 30 + (try ZipReader.u16(header, 26)) + (try ZipReader.u16(header, 28))
+    }
+
+    static func payload(_ e0: ZipEntry, max: Int, size: Int, _ raw: (Range<Int>) throws -> [UInt8]) throws -> [UInt8] {
+        var e = e0
+        e.dataOffset = try dataStart(e0, size: size, raw)
         if e.uncompressedSize > max {
             throw ZipError.limitExceeded("zip entry `\(e.name)` is \(e.uncompressedSize) bytes (max \(max))")
         }
@@ -644,9 +668,24 @@ public struct ZipReader: Sendable {
     }
 
     public init(_ bytes: [UInt8]) throws {
-        (entries, isZip64) = try ZipDirectory.read(ZipArrayBytes(array: bytes))
+        try self.init(bytes, lazyLocalHeaders: false)
+    }
+
+    /// `lazyLocalHeaders` reads only the central directory now, as the Rust `zip` crate does; each entry's local header
+    /// is read, and a damaged one fails, when that entry is read (`read`, `dataStart`).
+    public init(_ bytes: [UInt8], lazyLocalHeaders: Bool) throws {
+        (entries, isZip64) = try ZipDirectory.read(ZipArrayBytes(array: bytes), lazy: lazyLocalHeaders)
         self.bytes = bytes
         byName = ZipDirectory.index(entries)
+    }
+
+    /// Where `e`'s payload starts, reading its local header if the reader is lazy. The payload's end may lie past the
+    /// archive's (`read` refuses it).
+    public func dataStart(_ e: ZipEntry) throws -> Int {
+        try ZipDirectory.dataStart(e, size: bytes.count) { r in
+            guard r.lowerBound >= 0, r.upperBound <= bytes.count else { throw ZipError.corrupt("truncated zip") }
+            return Array(bytes[r])
+        }
     }
 
     public func find(_ name: String) -> ZipEntry? { byName[name].map { entries[$0] } }
