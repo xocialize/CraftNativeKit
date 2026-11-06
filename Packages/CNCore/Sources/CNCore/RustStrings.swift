@@ -5,11 +5,20 @@ import Foundation
 /// Rust's `str::trim`: strips Unicode `White_Space` scalars from both ends. Scalar by scalar, not character by
 /// character: a space that a combining mark follows is still whitespace to Rust.
 public func rustTrim(_ s: String) -> Substring {
+    // Fast path: both ends an ASCII byte that isn't White_Space (only 0x09–0x0D and the space are, below 0x80), so
+    // nothing to strip; skips a Unicode property lookup per call (Docs/perf-spike in GridCraftNative, Wave 3).
+    if let f = s.utf8.first, let l = s.utf8.last, f < 0x80, l < 0x80, !asciiWhiteSpace(f), !asciiWhiteSpace(l) {
+        return Substring(s)
+    }
+    if s.isEmpty { return "" }
     let u = s.unicodeScalars
     guard let start = u.firstIndex(where: { !$0.properties.isWhitespace }),
           let end = u.lastIndex(where: { !$0.properties.isWhitespace }) else { return "" }
     return Substring(u[start ... end])
 }
+
+/// Whether an ASCII byte is Unicode `White_Space` (tab, line feed, vertical tab, form feed, carriage return, space).
+@inline(__always) func asciiWhiteSpace(_ b: UInt8) -> Bool { (0x09 ... 0x0D).contains(b) || b == 0x20 }
 
 /// Rust's `to_ascii_lowercase`: only A–Z change.
 public func rustASCIILowercase(_ s: String) -> String {
@@ -27,7 +36,16 @@ public func rustFixed(_ v: Double, places: Int) -> String {
 /// Rust's `==` on strings: the same Unicode scalars (Swift's `==` also equates canonically equivalent
 /// strings, such as precomposed and decomposed `é`).
 public func rustEqual(_ a: String, _ b: String) -> Bool {
-    a.unicodeScalars.elementsEqual(b.unicodeScalars)
+    // The same scalars are the same UTF-8 bytes (a String is valid Unicode), and a native string knows its UTF-8
+    // length: unequal lengths answer at once (GridCraftNative Docs/perf-spike, Wave 3).
+    let n = a.utf8.count
+    guard n == b.utf8.count else { return false }
+    if n == 0 { return true }
+    let fast = a.utf8.withContiguousStorageIfAvailable { pa in
+        b.utf8.withContiguousStorageIfAvailable { pb in memcmp(pa.baseAddress, pb.baseAddress, n) == 0 }
+    }
+    if let f = fast, let equal = f { return equal }
+    return a.utf8.elementsEqual(b.utf8)
 }
 
 /// Rust's `str::to_uppercase`: each scalar's full uppercase mapping, no context.
@@ -101,8 +119,11 @@ func rustFloatSyntax(_ u: some Collection<UInt8>) -> Bool {
     var b = Array(u)
     if let f = b.first, f == UInt8(ascii: "+") || f == UInt8(ascii: "-") { b.removeFirst() }
     if b.isEmpty { return false }
-    let lower = String(decoding: b.map { $0 >= 0x41 && $0 <= 0x5A ? $0 + 32 : $0 }, as: UTF8.self)
-    if lower == "inf" || lower == "infinity" || lower == "nan" { return true }
+    // `inf`, `infinity` and `nan` start with a letter; a number never does, so only then is the lowered copy made.
+    if let f = b.first, (f | 0x20) == UInt8(ascii: "i") || (f | 0x20) == UInt8(ascii: "n") {
+        let lower = String(decoding: b.map { $0 >= 0x41 && $0 <= 0x5A ? $0 + 32 : $0 }, as: UTF8.self)
+        if lower == "inf" || lower == "infinity" || lower == "nan" { return true }
+    }
     var i = 0
     func isDigit(_ x: UInt8) -> Bool { x >= 0x30 && x <= 0x39 }
     var digits = 0

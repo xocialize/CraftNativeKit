@@ -78,6 +78,16 @@ import Testing
         let s = " \u{0301}x \u{0301}"
         #expect(rustTrim(s).unicodeScalars.elementsEqual("\u{0301}x \u{0301}".unicodeScalars))
         #expect(rustTrim("  ").isEmpty && rustTrim("").isEmpty)
+        // The ASCII fast path agrees with the scalar-by-scalar rule at both ends.
+        func reference(_ s: String) -> String {
+            let u = s.unicodeScalars
+            guard let a = u.firstIndex(where: { !$0.properties.isWhitespace }), let b = u.lastIndex(where: { !$0.properties.isWhitespace }) else { return "" }
+            return String(String.UnicodeScalarView(u[a ... b]))
+        }
+        for t in ["a", "ab", " a", "a ", "\u{0B}a", "a\u{0C}", "\u{85}a", "a\u{85}", "\u{A0}a\u{A0}", "a\u{2003}", "\u{3000}a",
+                  "a b", "\ta\r\n", "x\u{0301}", "\u{0301}", "é", "日本 ", "\u{1F642}"] {
+            #expect(rustTrim(t).unicodeScalars.elementsEqual(reference(t).unicodeScalars), "\(t.unicodeScalars.map { $0.value })")
+        }
         #expect(rustTrimStart(Substring(" \u{0301}a ")).unicodeScalars.elementsEqual("\u{0301}a ".unicodeScalars))
         #expect(rustTrimEnd(Substring(" a\u{0301} \u{0301}")).unicodeScalars.elementsEqual(" a\u{0301} \u{0301}".unicodeScalars))
         #expect(rustTrimEnd(Substring(" a \u{2003}")).unicodeScalars.elementsEqual(" a".unicodeScalars))

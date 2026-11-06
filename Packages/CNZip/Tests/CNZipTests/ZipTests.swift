@@ -83,6 +83,18 @@ import Testing
         #expect(throws: ZipError.limitExceeded("zip entry `a.txt` is 5 bytes (max 3)")) { try r.read(named: "a.txt", max: 3) }
     }
 
+    /// The system zlib's CRC-32 equals the table form on random data of every length up to 1,100 bytes, and in pieces.
+    @Test func zlibCRCMatchesTheTable() {
+        var x: UInt64 = 0x9E37_79B9_7F4A_7C15
+        var data: [UInt8] = []
+        for n in 0 ... 1100 {
+            #expect(CRC32.update(0, data) == CRC32.tableUpdate(0, data), "length \(n - 1)")
+            x ^= x << 13; x ^= x >> 7; x ^= x << 17
+            data.append(UInt8(truncatingIfNeeded: x))
+        }
+        #expect(CRC32.update(CRC32.update(0, Array(data[..<500])), Array(data[500...])) == CRC32.tableUpdate(0, data))
+    }
+
     @Test func crcMatchesBitwiseReference() {
         func reference(_ data: ArraySlice<UInt8>) -> UInt32 {
             var c: UInt32 = 0xFFFF_FFFF

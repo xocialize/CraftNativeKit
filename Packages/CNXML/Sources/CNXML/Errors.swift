@@ -270,6 +270,10 @@ public enum XMLError: Error, Sendable, Equatable, CustomStringConvertible {
 /// `std::str::from_utf8(bytes)` as quick-xml's `Decoder::decode` does it without the `encoding` feature.
 @inlinable
 public func decodeUTF8(_ bytes: ArraySlice<UInt8>) throws(XMLEncodingError) -> String {
+    // ASCII needs no validation, and `String(decoding:)` of it is the same string without the generic
+    // `String(validating:)`'s metadata lookups, a twelfth of an XLSX read (GridCraftNative Docs/perf-spike, Wave 3).
+    let ascii = bytes.withUnsafeBufferPointer { b in b.allSatisfy { $0 < 0x80 } }
+    if ascii { return String(decoding: bytes, as: UTF8.self) }
     if let s = String(validating: bytes, as: UTF8.self) { return s }
     throw .utf8(RustUTF8Error.check(bytes) ?? RustUTF8Error(validUpTo: 0, errorLen: 1))
 }

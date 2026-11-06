@@ -146,7 +146,9 @@ public enum XMLEscape {
 
     /// `normalize_xml10_eols`: CR LF and a lone CR become LF.
     public static func normalizeXML10EOLs(_ text: String) -> String {
-        guard text.utf8.contains(0x0D) else { return text }
+        // Over contiguous bytes where they are: the iterator's byte loop was a fiftieth of an XLSX read.
+        let hasCR = text.utf8.withContiguousStorageIfAvailable { $0.contains(0x0D) } ?? text.utf8.contains(0x0D)
+        guard hasCR else { return text }
         let b = Array(text.utf8)
         var out: [UInt8] = []
         out.reserveCapacity(b.count)
@@ -237,8 +239,11 @@ public enum XMLEscape {
     /// (XML 1.0 §3.3.3): references resolved, each whitespace character a space, line ends one space.
     public static func normalizeAttributeValue(_ value: String, version: XMLVersion, depth: Int = 1) throws(XMLEscapeError) -> String {
         let xml11 = version == .explicit1_1
+        // Checked in place: most values need nothing, and copying each one first cost a tenth of an XLSX read.
+        let needs = value.utf8.withContiguousStorageIfAvailable { $0.contains { isNormalizationChar($0, xml11) } }
+            ?? value.utf8.contains(where: { isNormalizationChar($0, xml11) })
+        guard needs else { return value }
         let input = Array(value.utf8)
-        guard input.contains(where: { isNormalizationChar($0, xml11) }) else { return value }
         var out: [UInt8] = []
         out.reserveCapacity(input.count)
         try normalizeAttrSteps(&out, input, depth: depth, xml11: xml11)

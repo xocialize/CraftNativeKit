@@ -11,6 +11,7 @@
 // are added here. Every decoder takes an output limit and never allocates from a declared size.
 
 import Compression
+import zlib
 import Foundation
 
 public enum Deflate {
@@ -156,6 +157,24 @@ public enum CRC32 {
 
     /// Continues a CRC with more bytes (`update(update(0, a), b) == checksum(a + b)`).
     public static func update(_ crc: UInt32, _ data: [UInt8]) -> UInt32 {
+        // The system zlib's `crc32` (the same IEEE polynomial, hardware-accelerated): the table loop below ran a byte
+        // at a time and cost about a sixth of an XLSX read or write in GridCraftNative (Docs/perf-spike, Wave 3).
+        // zlib takes a `uInt` length, so a buffer past 4 GiB goes in pieces.
+        data.withUnsafeBufferPointer { p in
+            guard var base = p.baseAddress else { return crc }
+            var c = uLong(crc), left = p.count
+            while left > 0 {
+                let n = min(left, Int(UInt32.max))
+                c = crc32(c, base, uInt(n))
+                base += n
+                left -= n
+            }
+            return UInt32(truncatingIfNeeded: c)
+        }
+    }
+
+    /// The byte-at-a-time table form `update` replaced, kept for the tests that check the two agree.
+    static func tableUpdate(_ crc: UInt32, _ data: [UInt8]) -> UInt32 {
         var c = ~crc
         data.withUnsafeBufferPointer { p in
             table.withUnsafeBufferPointer { t in

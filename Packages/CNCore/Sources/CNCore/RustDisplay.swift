@@ -92,18 +92,40 @@ enum RustFloatDisplay {
     static func plain(
         description: String, negative: Bool, mantissa: UInt64, exponent2: Int, readsBack: (String) -> Bool
     ) -> String {
-        let (shortest, k0) = ShortestFloat.decompose(description)
-        var s = negative ? "-" : ""
-        guard var digits = shortest else {
-            s += "0"
-            return s
+        // Over UTF-8 bytes (`description` is ASCII): the significant digits, and the power of ten of the last one, as
+        // `ShortestFloat.decompose` gives them. Characters cost a sixth of GridCraftNative's XLSX write (Wave 3).
+        var digits: [UInt8] = []
+        digits.reserveCapacity(24)
+        var fraction = 0, exponent = 0, exponentSign = 1, inExponent = false, seenDot = false
+        for b in description.utf8 {
+            if inExponent {
+                if b == UInt8(ascii: "-") { exponentSign = -1 } else if b >= 0x30, b <= 0x39 { exponent = exponent * 10 + Int(b - 0x30) }
+            } else if b == UInt8(ascii: "e") || b == UInt8(ascii: "E") {
+                inExponent = true
+            } else if b == UInt8(ascii: ".") {
+                seenDot = true
+            } else if b >= 0x30, b <= 0x39 {
+                if seenDot { fraction += 1 }
+                if !digits.isEmpty || b != 0x30 { digits.append(b) }
+            }
         }
-        var k = k0
+        var k = exponentSign * exponent - fraction
+        while let last = digits.last, last == 0x30 {
+            digits.removeLast()
+            k += 1
+        }
+        var out: [UInt8] = []
+        out.reserveCapacity(digits.count + 24)
+        if negative { out.append(UInt8(ascii: "-")) }
+        if digits.isEmpty {
+            out.append(0x30)
+            return String(decoding: out, as: UTF8.self)
+        }
         if isMidpoint(digits: digits, exponent10: k, mantissa: mantissa, exponent2: exponent2) {
             let up = incremented(digits)
-            if readsBack(String(up) + "e" + String(k)) {
+            if readsBack(String(decoding: up, as: UTF8.self) + "e" + String(k)) {
                 digits = up
-                while digits.count > 1, digits.last == "0" {
+                while digits.count > 1, digits.last == 0x30 {
                     digits.removeLast()
                     k += 1
                 }
@@ -113,27 +135,32 @@ enum RustFloatDisplay {
         let decExp = length + k - 1 // the power of ten of the first digit
         if k >= 0 {
             // 1234e3 -> 1234000
-            s += String(digits) + String(repeating: "0", count: k)
+            out += digits
+            out += repeatElement(0x30, count: k)
         } else if decExp >= 0 {
             // 1234e-2 -> 12.34
-            s += String(digits[...decExp]) + "." + String(digits[(decExp + 1)...])
+            out += digits[...decExp]
+            out.append(UInt8(ascii: "."))
+            out += digits[(decExp + 1)...]
         } else {
             // 1234e-6 -> 0.001234
-            s += "0." + String(repeating: "0", count: -decExp - 1) + String(digits)
+            out += [0x30, UInt8(ascii: ".")]
+            out += repeatElement(0x30, count: -decExp - 1)
+            out += digits
         }
-        return s
+        return String(decoding: out, as: UTF8.self)
     }
 }
 
 extension RustFloatDisplay {
     /// Is `mantissa · 2^exponent2` exactly `(digits + ½) · 10^exponent10`, that is
     /// `(10·digits + 5) · 10^(exponent10 − 1)`? Compared as odd part and power of two, in integers.
-    static func isMidpoint(digits: [Character], exponent10: Int, mantissa: UInt64, exponent2: Int) -> Bool {
+    static func isMidpoint(digits: [UInt8], exponent10: Int, mantissa: UInt64, exponent2: Int) -> Bool {
         guard mantissa != 0, digits.count <= 17 else { return false }
         var n: UInt64 = 0
-        for c in digits {
-            guard let v = c.wholeNumberValue else { return false }
-            n = n * 10 + UInt64(v)
+        for a in digits {
+            guard a >= 0x30, a <= 0x39 else { return false }
+            n = n * 10 + UInt64(a - 0x30)
         }
         n = n * 10 + 5 // odd: the midpoint's significand
         let j = exponent10 - 1
@@ -163,19 +190,19 @@ extension RustFloatDisplay {
     }
 
     /// `digits + 1` as a decimal string (`129` → `130`, `99` → `100`).
-    static func incremented(_ digits: [Character]) -> [Character] {
+    static func incremented(_ digits: [UInt8]) -> [UInt8] {
         var d = digits
         var i = d.count - 1
         while i >= 0 {
-            if d[i] == "9" {
-                d[i] = "0"
+            if d[i] == UInt8(ascii: "9") {
+                d[i] = 0x30
                 i -= 1
             } else {
-                d[i] = Character(UnicodeScalar(UInt8(ascii: "0") + UInt8(d[i].wholeNumberValue ?? 0) + 1))
+                d[i] += 1
                 return d
             }
         }
-        return ["1"] + d
+        return [UInt8(ascii: "1")] + d
     }
 }
 
